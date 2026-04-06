@@ -83,6 +83,32 @@ function parseError(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
 }
 
+function mergeNightlyDelta(base: NightlyDelta, delta: NightlyDelta): NightlyDelta {
+  return {
+    knocks: base.knocks + delta.knocks,
+    talks: base.talks + delta.talks,
+    inspections: base.inspections + delta.inspections,
+    contingencies: base.contingencies + delta.contingencies,
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(errorMessage));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }
+}
+
 type KnockStageTarget = "lead" | "contingency";
 
 const KNOCK_STAGE_ID_BY_TARGET: Record<KnockStageTarget, number> = {
@@ -549,6 +575,7 @@ export default function KnockingPage() {
     action: KnockAction;
     outcome?: KnockOutcome | null;
     homeownerRequired?: boolean;
+    contingentOverride?: boolean;
   }) {
     if (!session || !user || !accessToken) return;
     if (session.status !== "active") {
@@ -571,7 +598,11 @@ export default function KnockingPage() {
       const eventAddress = homeownerIntake.address.trim() || doorAddress.trim() || currentAddress;
       const isInspection = params.action === "knock" && params.outcome === "inspection";
       const isSoftSet = params.action === "knock" && params.outcome === "soft_set";
-      const shouldMoveToContingency = isInspection && inspectionChecklist.contingent;
+      const isContingent = isInspection
+        ? params.contingentOverride ?? inspectionChecklist.contingent
+        : false;
+      const inspectionSnapshot = isInspection ? { ...inspectionChecklist, contingent: isContingent } : null;
+      const shouldMoveToContingency = isInspection && isContingent;
       const stageTarget: KnockStageTarget | null = shouldMoveToContingency
         ? "contingency"
         : isInspection || isSoftSet
@@ -671,11 +702,11 @@ export default function KnockingPage() {
           `Phone: ${homeownerIntake.phone || "-"}\n` +
           `Email: ${homeownerIntake.email || "-"}\n` +
           `Address: ${eventAddress || "-"}\n` +
-          `Roof Age: ${inspectionChecklist.roofAge || "-"}\n` +
-          `Visible Damage: ${inspectionChecklist.visibleDamage || "-"}\n` +
-          `Carrier: ${inspectionChecklist.insuranceCarrier || "-"}\n` +
-          `Contingent: ${inspectionChecklist.contingent ? "Yes" : "No"}\n` +
-          `Notes: ${inspectionChecklist.notes || "-"}`;
+          `Roof Age: ${inspectionSnapshot?.roofAge || "-"}\n` +
+          `Visible Damage: ${inspectionSnapshot?.visibleDamage || "-"}\n` +
+          `Carrier: ${inspectionSnapshot?.insuranceCarrier || "-"}\n` +
+          `Contingent: ${isContingent ? "Yes" : "No"}\n` +
+          `Notes: ${inspectionSnapshot?.notes || "-"}`;
 
         await crmApi.createJobNote(linkedJobId, accessToken, summary);
       }
@@ -683,7 +714,7 @@ export default function KnockingPage() {
       const delta = getEventDelta({
         action: params.action,
         outcome: params.action === "knock" ? params.outcome ?? "no_answer" : null,
-        contingent: isInspection ? inspectionChecklist.contingent : false,
+        contingent: isContingent,
       });
 
       const eventPayload: JsonRecord = {
@@ -706,13 +737,13 @@ export default function KnockingPage() {
         is_locked: Boolean(linkedJobId || linkedTaskId),
         metadata: isInspection
           ? {
-              checklist: inspectionChecklist,
+              checklist: inspectionSnapshot,
               photo_count: inspectionPhotos.length,
             }
           : {},
       };
 
-      const [{ error: insertError }, { error: sessionError }] = await Promise.all([
+      const [{ error: insertError }, { data: updatedSession, error: sessionError }] = await Promise.all([
         supabase.from("knock_events").insert(eventPayload),
         supabase
           .from("knock_sessions")
@@ -733,9 +764,19 @@ export default function KnockingPage() {
 
       if (insertError) throw new Error(insertError.message);
       if (sessionError) throw new Error(sessionError.message);
+      if (updatedSession) {
+        setSession(updatedSession as KnockSessionRow);
+      }
 
       if (includeInNightlyNumbers) {
-        await applyNightlyDelta(delta);
+        setTodayTotals((previous) => mergeNightlyDelta(previous, delta));
+        try {
+          await withTimeout(applyNightlyDelta(delta), 7000, "Nightly numbers sync timed out.");
+        } catch (nightlyError) {
+          postSaveWarnings.push(
+            `Nightly numbers sync delayed: ${parseError(nightlyError, "Unknown nightly sync error.")}`,
+          );
+        }
       }
 
       setHomeownerIntake({ ...DEFAULT_INTAKE, address: eventAddress || "" });
@@ -1001,7 +1042,7 @@ export default function KnockingPage() {
               />
             </label>
             <button type="submit" disabled={saving}>
-              Save Soft Set
+              {saving ? "Saving..." : "Save Soft Set"}
             </button>
             <button type="button" className="secondary" onClick={() => setStep("homeowner")}>Back</button>
           </form>
@@ -1012,7 +1053,15 @@ export default function KnockingPage() {
             className="knock-step stack"
             onSubmit={(e) => {
               e.preventDefault();
-              void logEvent({ action: "knock", outcome: "inspection", homeownerRequired: true });
+              const contingentInput = e.currentTarget.elements.namedItem("contingent");
+              const contingentChecked =
+                contingentInput instanceof HTMLInputElement ? contingentInput.checked : undefined;
+              void logEvent({
+                action: "knock",
+                outcome: "inspection",
+                homeownerRequired: true,
+                contingentOverride: contingentChecked,
+              });
             }}
           >
             <h2>Inspection Intake</h2>
@@ -1046,6 +1095,7 @@ export default function KnockingPage() {
               <span>Contingency signed</span>
               <input
                 type="checkbox"
+                name="contingent"
                 style={{ width: "auto" }}
                 checked={inspectionChecklist.contingent}
                 onChange={(e) =>
@@ -1071,7 +1121,7 @@ export default function KnockingPage() {
               />
             </label>
             <button type="submit" disabled={saving}>
-              Save Inspection
+              {saving ? "Saving..." : "Save Inspection"}
             </button>
             <button type="button" className="secondary" onClick={() => setStep("homeowner")}>Back</button>
           </form>
