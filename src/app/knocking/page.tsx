@@ -277,7 +277,6 @@ export default function KnockingPage() {
   const [potentialLeadError, setPotentialLeadError] = useState<string | null>(null);
   const [potentialLeadMessage, setPotentialLeadMessage] = useState("");
   const [savingPotentialLead, setSavingPotentialLead] = useState(false);
-  const [deletingPotentialLeadId, setDeletingPotentialLeadId] = useState<string | null>(null);
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [todayTotals, setTodayTotals] = useState<NightlyDelta>({
     knocks: 0,
@@ -673,30 +672,6 @@ export default function KnockingPage() {
       setPotentialLeadError(parseError(saveError, "Could not save potential lead."));
     } finally {
       setSavingPotentialLead(false);
-    }
-  }
-
-  async function removePotentialLead(leadId: string) {
-    setDeletingPotentialLeadId(leadId);
-    setPotentialLeadError(null);
-    setPotentialLeadMessage("");
-
-    try {
-      const { error: deleteError } = await supabase
-        .from("knock_potential_leads")
-        .delete()
-        .eq("id", leadId);
-
-      if (deleteError) {
-        throw new Error(deleteError.message);
-      }
-
-      setPotentialLeads((previous) => previous.filter((lead) => lead.id !== leadId));
-      setPotentialLeadMessage("Potential lead removed.");
-    } catch (deleteError) {
-      setPotentialLeadError(parseError(deleteError, "Could not remove potential lead."));
-    } finally {
-      setDeletingPotentialLeadId(null);
     }
   }
 
@@ -1287,39 +1262,14 @@ export default function KnockingPage() {
 
           {potentialLeadError ? <p className="error">{potentialLeadError}</p> : null}
           {potentialLeadMessage ? <p className="hint">{potentialLeadMessage}</p> : null}
-          {loadingPotentialLeads ? <p className="hint">Loading potential leads...</p> : null}
-
-          {potentialLeads.length > 0 ? (
-            <div className="jobs">
-              {potentialLeads.slice(0, 12).map((lead) => (
-                <article key={lead.id} className="job-card">
-                  <div className="row">
-                    <strong>{lead.address}</strong>
-                    <button
-                      type="button"
-                      className="secondary"
-                      onClick={() => void removePotentialLead(lead.id)}
-                      disabled={deletingPotentialLeadId === lead.id}
-                    >
-                      {deletingPotentialLeadId === lead.id ? "Removing..." : "Remove"}
-                    </button>
-                  </div>
-                  <p className="hint">
-                    {typeof lead.homeowner_name === "string" && lead.homeowner_name.trim().length > 0
-                      ? `Homeowner: ${lead.homeowner_name}`
-                      : "Homeowner: -"}
-                  </p>
-                  {typeof lead.notes === "string" && lead.notes.trim().length > 0 ? (
-                    <p className="muted">{lead.notes}</p>
-                  ) : null}
-                  <p className="hint">Added: {lead.created_at ? new Date(lead.created_at).toLocaleString() : "-"}</p>
-                </article>
-              ))}
-              {potentialLeads.length > 12 ? (
-                <p className="hint">Showing first 12 of {potentialLeads.length} potential leads.</p>
-              ) : null}
-            </div>
-          ) : null}
+          <p className="hint">
+            {loadingPotentialLeads
+              ? "Loading saved potential leads..."
+              : "Potential leads are shown on the Doors Map and in the list below the map."}
+          </p>
+          <p className="hint">
+            <Link href="/knocking/doors">Open Doors Map</Link>
+          </p>
         </section>
       </AppShell>
     );
