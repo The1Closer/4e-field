@@ -1209,7 +1209,6 @@ export default function KnockingPage() {
         <section className="panel">
           <div className="row">
             <h2 style={{ margin: 0 }}>Potential Leads For Doors Map</h2>
-            <p className="hint">{potentialLeads.length} saved</p>
           </div>
           <p className="hint">
             Add addresses here to display as potential leads on the Doors Map without creating a job.
@@ -1265,7 +1264,7 @@ export default function KnockingPage() {
           <p className="hint">
             {loadingPotentialLeads
               ? "Loading saved potential leads..."
-              : "Potential leads are shown on the Doors Map and in the list below the map."}
+              : "Potential leads are shown on the Doors Map."}
           </p>
           <p className="hint">
             <Link href="/knocking/doors">Open Doors Map</Link>
