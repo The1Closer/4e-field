@@ -189,6 +189,22 @@ select {
   gap: 8px;
 }
 
+.bell-btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  font-size: 1rem;
+}
+
+.bell-btn-active {
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px rgba(214, 179, 122, 0.22) inset;
+}
+
 .desktop-only {
   display: none;
 }

@@ -29,11 +29,9 @@ const navItems: NavItem[] = [
   { href: "/jobs", label: "Home" },
   { href: "/knocking", label: "Knocking" },
   { href: "/knocking/doors", label: "Doors Map" },
-  { href: "/tasks", label: "Tasks" },
-  { href: "/notifications", label: "Notifications" },
 ];
 
-const MOBILE_PRIMARY_HREFS = ["/jobs", "/knocking", "/tasks", "/notifications"];
+const MOBILE_PRIMARY_HREFS = ["/jobs", "/knocking", "/knocking/doors"];
 const SHOW_DEBUG_BANNER = process.env.NEXT_PUBLIC_SHOW_DEBUG_BANNER === "true";
 
 function isNavItemActive(pathname: string, href: string) {
@@ -43,6 +41,10 @@ function isNavItemActive(pathname: string, href: string) {
 function roleLabel(role: UserRole | null) {
   if (!role) return "unknown";
   return role.replaceAll("_", " ");
+}
+
+function isActivityPath(pathname: string) {
+  return pathname === "/notifications" || pathname === "/tasks";
 }
 
 export function AppShell({ role, onSignOut, debug, children }: Props) {
@@ -125,6 +127,14 @@ export function AppShell({ role, onSignOut, debug, children }: Props) {
           </div>
 
           <div className="shell-actions">
+            <Link
+              href="/notifications"
+              className={isActivityPath(pathname) ? "secondary icon-btn bell-btn bell-btn-active" : "secondary icon-btn bell-btn"}
+              aria-label="Open notifications and tasks"
+              title="Notifications and Tasks"
+            >
+              <span aria-hidden="true">🔔</span>
+            </Link>
             <ThemeToggle />
             <button
               className="secondary"
