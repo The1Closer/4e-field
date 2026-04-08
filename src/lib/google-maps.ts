@@ -126,7 +126,7 @@ export async function loadGoogleMaps(apiKey: string): Promise<GoogleMapsNamespac
       const script = document.createElement("script");
       script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(
         apiKey,
-      )}&v=weekly&callback=${encodeURIComponent(callbackName)}`;
+      )}&v=weekly&libraries=drawing&callback=${encodeURIComponent(callbackName)}`;
       script.async = true;
       script.defer = true;
       script.dataset.googleMaps = "true";
