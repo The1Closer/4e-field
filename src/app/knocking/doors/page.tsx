@@ -1463,6 +1463,9 @@ export default function KnockingDoorsPage() {
 
     clearActionFeedback();
     setRouteStartMode("pin");
+    if (selectedRoutePinOptions.length > 0) {
+      setRouteStartPinKey(selectedRoutePinOptions[0].key);
+    }
     setRouteStartPromptOpen(true);
   }
 
@@ -1499,20 +1502,11 @@ export default function KnockingDoorsPage() {
       }
 
       let origin: { lat: number; lng: number };
-      let destination: { lat: number; lng: number };
-      let waypoints: Array<{
-        location: { lat: number; lng: number };
-        stopover: true;
-      }>;
+      let startPinAddressKey = "";
 
       if (startMode === "user_location") {
         const userLocation = await getBrowserGeolocation();
         origin = userLocation;
-        destination = userLocation;
-        waypoints = routeStops.map((pin) => ({
-          location: { lat: pin.lat as number, lng: pin.lng as number },
-          stopover: true as const,
-        }));
       } else {
         const requestedStartPin =
           (startPinKey
@@ -1525,24 +1519,76 @@ export default function KnockingDoorsPage() {
           lat: requestedStartPin.lat as number,
           lng: requestedStartPin.lng as number,
         };
-        destination = origin;
-        const nonStartStops = routeStops.filter(
-          (pin) => normalizeAddress(pin.address) !== normalizeAddress(requestedStartPin.address),
-        );
-        waypoints = nonStartStops.map((pin) => ({
-          location: { lat: pin.lat as number, lng: pin.lng as number },
-          stopover: true as const,
-        }));
+        startPinAddressKey = normalizeAddress(requestedStartPin.address);
+      }
+
+      const endpointCandidates = routeStops.filter((pin) => {
+        if (startMode === "pin" && routeStops.length > 1) {
+          return normalizeAddress(pin.address) !== startPinAddressKey;
+        }
+        return true;
+      });
+
+      if (endpointCandidates.length === 0) {
+        setActionError("Could not determine endpoint candidates for this route.");
+        return;
       }
 
       const directionsService = new maps.DirectionsService();
-      const result = await directionsService.route({
-        origin,
-        destination,
-        waypoints,
-        optimizeWaypoints: true,
-        travelMode: maps.TravelMode.DRIVING,
-      });
+      let bestResult: any = null;
+      let bestWaypoints: Array<{
+        location: { lat: number; lng: number };
+        stopover: true;
+      }> = [];
+      let bestDestination: { lat: number; lng: number } | null = null;
+      let bestDurationSeconds = Number.POSITIVE_INFINITY;
+
+      for (const endpoint of endpointCandidates) {
+        const endpointAddressKey = normalizeAddress(endpoint.address);
+        const destination = {
+          lat: endpoint.lat as number,
+          lng: endpoint.lng as number,
+        };
+
+        const intermediateStops = routeStops.filter((pin) => {
+          const key = normalizeAddress(pin.address);
+          if (key === endpointAddressKey) return false;
+          if (startMode === "pin" && routeStops.length > 1 && key === startPinAddressKey) {
+            return false;
+          }
+          return true;
+        });
+
+        const waypoints = intermediateStops.map((pin) => ({
+          location: { lat: pin.lat as number, lng: pin.lng as number },
+          stopover: true as const,
+        }));
+
+        const routeResult = await directionsService.route({
+          origin,
+          destination,
+          waypoints,
+          optimizeWaypoints: true,
+          travelMode: maps.TravelMode.DRIVING,
+        });
+
+        const legs = routeResult.routes?.[0]?.legs ?? [];
+        const durationSeconds = legs.reduce(
+          (sum: number, leg: any) => sum + Number(leg?.duration?.value ?? 0),
+          0,
+        );
+
+        if (durationSeconds < bestDurationSeconds) {
+          bestDurationSeconds = durationSeconds;
+          bestResult = routeResult;
+          bestWaypoints = waypoints;
+          bestDestination = destination;
+        }
+      }
+
+      if (!bestResult || !bestDestination) {
+        throw new Error("Could not generate optimized route.");
+      }
 
       if (!directionsRendererRef.current) {
         directionsRendererRef.current = new maps.DirectionsRenderer({
@@ -1557,12 +1603,12 @@ export default function KnockingDoorsPage() {
       }
 
       directionsRendererRef.current.setMap(mapRef.current);
-      directionsRendererRef.current.setDirections(result);
+      directionsRendererRef.current.setDirections(bestResult);
 
       const optimizedWaypointOrder: number[] =
-        result.routes?.[0]?.waypoint_order ?? [];
+        bestResult.routes?.[0]?.waypoint_order ?? [];
       const orderedWaypointLocations = optimizedWaypointOrder.map((index) => {
-        const point = waypoints[index]?.location;
+        const point = bestWaypoints[index]?.location;
         return formatLatLng(point.lat, point.lng);
       });
 
@@ -1583,27 +1629,20 @@ export default function KnockingDoorsPage() {
           startMode === "user_location"
             ? "Current Location"
             : formatLatLng(origin.lat, origin.lng),
-        destination:
-          startMode === "user_location"
-            ? "Current Location"
-            : formatLatLng(destination.lat, destination.lng),
+        destination: formatLatLng(bestDestination.lat, bestDestination.lng),
         waypointLocations: waypointLocationsForLaunch,
       });
       setRouteLaunchUrl(mapsLaunchUrl);
 
-      const legs = result.routes?.[0]?.legs ?? [];
+      const legs = bestResult.routes?.[0]?.legs ?? [];
       const totalDistanceMeters = legs.reduce(
         (sum: number, leg: any) => sum + Number(leg?.distance?.value ?? 0),
         0,
       );
-      const totalDurationSeconds = legs.reduce(
-        (sum: number, leg: any) => sum + Number(leg?.duration?.value ?? 0),
-        0,
-      );
       setRouteSummary({
-        stopCount: startMode === "user_location" ? routeStops.length : waypoints.length + 1,
+        stopCount: routeStops.length,
         totalDistanceMiles: totalDistanceMeters / 1609.344,
-        totalDurationMinutes: totalDurationSeconds / 60,
+        totalDurationMinutes: bestDurationSeconds / 60,
       });
     } catch (routeError) {
       setActionError(
@@ -1992,7 +2031,7 @@ export default function KnockingDoorsPage() {
         {routeSummary ? (
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
             <p className="hint" style={{ margin: 0 }}>
-              Optimized loop for {routeSummary.stopCount} stops | Distance:{" "}
+              Optimized route for {routeSummary.stopCount} stops | Distance:{" "}
               {formatMiles(routeSummary.totalDistanceMiles)} | ETA:{" "}
               {formatMinutes(routeSummary.totalDurationMinutes)}
             </p>
@@ -2019,7 +2058,7 @@ export default function KnockingDoorsPage() {
           >
             <h3 style={{ margin: 0, fontSize: "1rem" }}>Route Start Point</h3>
             <p className="hint">
-              Choose where this optimized route should start.
+              Choose where the route should start. The end point is auto-optimized.
             </p>
             <label className="row" style={{ gap: 8 }}>
               <input
@@ -2060,7 +2099,7 @@ export default function KnockingDoorsPage() {
                 onClick={() => void confirmRouteStartAndGenerate()}
                 disabled={
                   buildingRoute ||
-                  (routeStartMode === "pin" && selectedRoutePinOptions.length === 0)
+                  selectedRoutePinOptions.length === 0
                 }
               >
                 {buildingRoute ? "Building Route..." : "Build Route"}

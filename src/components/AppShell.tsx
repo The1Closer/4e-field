@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { DebugBanner } from "@/components/DebugBanner";
@@ -106,7 +107,16 @@ export function AppShell({ role, onSignOut, debug, children }: Props) {
             </button>
 
             <Link href="/jobs" className="shell-brand">
-              <span className="shell-brand-mark">4E</span>
+              <span className="shell-brand-mark">
+                <Image
+                  src="/4ELogo.png"
+                  alt="CRM logo"
+                  width={38}
+                  height={38}
+                  className="shell-brand-logo"
+                  priority
+                />
+              </span>
               <span className="shell-brand-text">
                 <strong>Field</strong>
                 <span className="muted">Role: {roleLabel(role)}</span>
