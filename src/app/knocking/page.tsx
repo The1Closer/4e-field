@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import AddressAutocompleteInput from "@/components/AddressAutocompleteInput";
 import { AppShell } from "@/components/AppShell";
 import { crmApi } from "@/lib/crm-api";
 import {
@@ -35,6 +36,38 @@ type KnockSessionRow = JsonRecord & {
   contingencies?: number | null;
 };
 
+type SessionKnockEventRow = JsonRecord & {
+  id: string;
+  session_id: string;
+  rep_id: string;
+  action: KnockAction;
+  outcome?: KnockOutcome | null;
+  address?: string | null;
+  homeowner_name?: string | null;
+  homeowner_phone?: string | null;
+  homeowner_email?: string | null;
+  created_at?: string | null;
+  is_locked?: boolean | null;
+  linked_job_id?: string | null;
+  linked_task_id?: string | null;
+  knocks_delta?: number | null;
+  talks_delta?: number | null;
+  inspections_delta?: number | null;
+  contingencies_delta?: number | null;
+};
+
+type PotentialLeadRow = JsonRecord & {
+  id: string;
+  rep_id: string;
+  address: string;
+  address_normalized?: string | null;
+  homeowner_name?: string | null;
+  notes?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  created_at?: string | null;
+};
+
 type HomeownerIntake = {
   homeownerName: string;
   phone: string;
@@ -43,6 +76,21 @@ type HomeownerIntake = {
 };
 
 type SessionStep = "door" | "outcome" | "homeowner" | "follow_up" | "inspection";
+type EditableKnockOutcome = "no_answer" | "no";
+
+type SessionEventEditDraft = {
+  outcome: EditableKnockOutcome;
+  address: string;
+  homeownerName: string;
+  homeownerPhone: string;
+  homeownerEmail: string;
+};
+
+type PotentialLeadDraft = {
+  address: string;
+  homeownerName: string;
+  notes: string;
+};
 
 const DEFAULT_INTAKE: HomeownerIntake = {
   homeownerName: "",
@@ -59,9 +107,22 @@ const DEFAULT_CHECKLIST = {
   contingent: false,
 };
 
+const DEFAULT_POTENTIAL_LEAD_DRAFT: PotentialLeadDraft = {
+  address: "",
+  homeownerName: "",
+  notes: "",
+};
+
+const KNOCK_EVENT_SELECT =
+  "id,session_id,rep_id,action,outcome,address,homeowner_name,homeowner_phone,homeowner_email,created_at,is_locked,linked_job_id,linked_task_id,knocks_delta,talks_delta,inspections_delta,contingencies_delta";
+
 function toNum(value: unknown) {
   const num = Number(value);
   return Number.isFinite(num) ? num : 0;
+}
+
+function normalizeAddress(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function toIsoFromLocalInput(value: string) {
@@ -81,6 +142,37 @@ function formatDuration(totalSeconds: number) {
 
 function parseError(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function displayOutcome(value: string | null | undefined) {
+  if (value === "no_answer") return "No Answer";
+  if (value === "soft_set") return "Soft Set";
+  if (value === "inspection") return "Inspection";
+  if (value === "no") return "No";
+  return "Unknown";
+}
+
+function eventTitle(action: string | null | undefined, outcome: string | null | undefined) {
+  if (action === "door_hanger") return "Door Hanger";
+  return `Knock: ${displayOutcome(outcome)}`;
+}
+
+function editableOutcome(value: unknown): EditableKnockOutcome {
+  return value === "no" ? "no" : "no_answer";
+}
+
+function eventIsCrmLocked(event: SessionKnockEventRow) {
+  return Boolean(event.is_locked || event.linked_job_id || event.linked_task_id);
+}
+
+function makeEditDraft(event: SessionKnockEventRow): SessionEventEditDraft {
+  return {
+    outcome: editableOutcome(event.outcome),
+    address: typeof event.address === "string" ? event.address : "",
+    homeownerName: typeof event.homeowner_name === "string" ? event.homeowner_name : "",
+    homeownerPhone: typeof event.homeowner_phone === "string" ? event.homeowner_phone : "",
+    homeownerEmail: typeof event.homeowner_email === "string" ? event.homeowner_email : "",
+  };
 }
 
 function mergeNightlyDelta(base: NightlyDelta, delta: NightlyDelta): NightlyDelta {
@@ -138,6 +230,27 @@ async function reverseGeocode(lat: number, lng: number, apiKey: string) {
   return typeof address === "string" && address.trim().length > 0 ? address : null;
 }
 
+async function geocodeAddressInput(address: string, apiKey: string) {
+  if (!apiKey.trim()) return null;
+  const response = await fetch(
+    `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
+      address,
+    )}&key=${encodeURIComponent(apiKey)}`,
+  );
+  const payload = (await response.json()) as {
+    status?: string;
+    results?: Array<{ geometry?: { location?: { lat?: number; lng?: number } } }>;
+  };
+  if (payload.status !== "OK") return null;
+  const location = payload.results?.[0]?.geometry?.location;
+  if (!location) return null;
+
+  const lat = Number(location.lat);
+  const lng = Number(location.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat: Number(lat), lng: Number(lng) };
+}
+
 export default function KnockingPage() {
   const router = useRouter();
   const {
@@ -153,6 +266,18 @@ export default function KnockingPage() {
   const supabase = getSupabaseBrowserClient();
 
   const [session, setSession] = useState<KnockSessionRow | null>(null);
+  const [sessionEvents, setSessionEvents] = useState<SessionKnockEventRow[]>([]);
+  const [loadingSessionEvents, setLoadingSessionEvents] = useState(false);
+  const [sessionEventsError, setSessionEventsError] = useState<string | null>(null);
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [eventEditDraft, setEventEditDraft] = useState<SessionEventEditDraft | null>(null);
+  const [potentialLeads, setPotentialLeads] = useState<PotentialLeadRow[]>([]);
+  const [loadingPotentialLeads, setLoadingPotentialLeads] = useState(false);
+  const [potentialLeadDraft, setPotentialLeadDraft] = useState<PotentialLeadDraft>(DEFAULT_POTENTIAL_LEAD_DRAFT);
+  const [potentialLeadError, setPotentialLeadError] = useState<string | null>(null);
+  const [potentialLeadMessage, setPotentialLeadMessage] = useState("");
+  const [savingPotentialLead, setSavingPotentialLead] = useState(false);
+  const [deletingPotentialLeadId, setDeletingPotentialLeadId] = useState<string | null>(null);
   const [sessionSeconds, setSessionSeconds] = useState(0);
   const [todayTotals, setTodayTotals] = useState<NightlyDelta>({
     knocks: 0,
@@ -188,6 +313,7 @@ export default function KnockingPage() {
   const geocodeApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
   const canLog = Boolean(session && session.status === "active" && accessToken);
+  const canEditSessionEvents = Boolean(session && (session.status === "active" || session.status === "paused"));
   const sessionStatusLabel = useMemo(() => {
     if (!session) return "NOT STARTED";
     return session.status.toUpperCase();
@@ -258,6 +384,79 @@ export default function KnockingPage() {
       active = false;
     };
   }, [supabase, user]);
+
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+
+    const loadPotentialLeads = async () => {
+      setLoadingPotentialLeads(true);
+      setPotentialLeadError(null);
+
+      const { data, error: leadsError } = await supabase
+        .from("knock_potential_leads")
+        .select("id,rep_id,address,address_normalized,homeowner_name,notes,latitude,longitude,created_at")
+        .order("created_at", { ascending: false })
+        .limit(120);
+
+      if (!active) return;
+
+      if (leadsError) {
+        setPotentialLeads([]);
+        setPotentialLeadError(leadsError.message);
+      } else {
+        setPotentialLeads((data ?? []) as PotentialLeadRow[]);
+      }
+
+      setLoadingPotentialLeads(false);
+    };
+
+    void loadPotentialLeads();
+
+    return () => {
+      active = false;
+    };
+  }, [supabase, user]);
+
+  useEffect(() => {
+    if (!session?.id) {
+      setSessionEvents([]);
+      setSessionEventsError(null);
+      setEditingEventId(null);
+      setEventEditDraft(null);
+      return;
+    }
+
+    let active = true;
+    const loadSessionEvents = async () => {
+      setLoadingSessionEvents(true);
+      setSessionEventsError(null);
+
+      const { data, error: loadError } = await supabase
+        .from("knock_events")
+        .select(KNOCK_EVENT_SELECT)
+        .eq("session_id", session.id)
+        .order("created_at", { ascending: false })
+        .limit(400);
+
+      if (!active) return;
+
+      if (loadError) {
+        setSessionEvents([]);
+        setSessionEventsError(loadError.message);
+      } else {
+        setSessionEvents((data ?? []) as SessionKnockEventRow[]);
+      }
+
+      setLoadingSessionEvents(false);
+    };
+
+    void loadSessionEvents();
+
+    return () => {
+      active = false;
+    };
+  }, [session?.id, supabase]);
 
   useEffect(() => {
     if (!session) return;
@@ -356,6 +555,150 @@ export default function KnockingPage() {
       }
     };
   }, [doorAddress, geocodeApiKey, session, supabase]);
+
+  function canEditEventRow(event: SessionKnockEventRow) {
+    return canEditSessionEvents && !eventIsCrmLocked(event);
+  }
+
+  function beginEditingEvent(event: SessionKnockEventRow) {
+    if (!canEditEventRow(event)) {
+      return;
+    }
+    setEditingEventId(event.id);
+    setEventEditDraft(makeEditDraft(event));
+    setSessionEventsError(null);
+    setMessage("");
+    setError(null);
+  }
+
+  function cancelEditingEvent() {
+    setEditingEventId(null);
+    setEventEditDraft(null);
+  }
+
+  async function saveEventEdits(event: SessionKnockEventRow) {
+    if (!session || !eventEditDraft) return;
+    if (!canEditEventRow(event)) {
+      setSessionEventsError("This knock can no longer be edited.");
+      return;
+    }
+
+    setSaving(true);
+    setSessionEventsError(null);
+    setMessage("");
+    setError(null);
+
+    try {
+      const updatePayload = {
+        outcome: event.action === "knock" ? eventEditDraft.outcome : null,
+        address: eventEditDraft.address.trim() || null,
+        homeowner_name: eventEditDraft.homeownerName.trim() || null,
+        homeowner_phone: eventEditDraft.homeownerPhone.trim() || null,
+        homeowner_email: eventEditDraft.homeownerEmail.trim() || null,
+      };
+
+      const { data, error: updateError } = await supabase
+        .from("knock_events")
+        .update(updatePayload)
+        .eq("id", event.id)
+        .eq("session_id", session.id)
+        .select(KNOCK_EVENT_SELECT)
+        .single();
+
+      if (updateError || !data) {
+        throw new Error(updateError?.message || "Failed to update this knock.");
+      }
+
+      const updated = data as SessionKnockEventRow;
+      setSessionEvents((previous) =>
+        previous.map((row) => (row.id === updated.id ? updated : row)),
+      );
+      setEditingEventId(null);
+      setEventEditDraft(null);
+      setMessage("Knock updated for this session.");
+    } catch (updateError) {
+      setSessionEventsError(parseError(updateError, "Failed to update this knock."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function addPotentialLead(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!user) return;
+
+    const address = potentialLeadDraft.address.trim();
+    if (!address) {
+      setPotentialLeadError("Address is required.");
+      return;
+    }
+
+    setSavingPotentialLead(true);
+    setPotentialLeadError(null);
+    setPotentialLeadMessage("");
+
+    try {
+      let coordinates: { lat: number; lng: number } | null = null;
+      try {
+        coordinates = await geocodeAddressInput(address, geocodeApiKey);
+      } catch {
+        coordinates = null;
+      }
+
+      const payload = {
+        rep_id: user.id,
+        address,
+        address_normalized: normalizeAddress(address),
+        homeowner_name: potentialLeadDraft.homeownerName.trim() || null,
+        notes: potentialLeadDraft.notes.trim() || null,
+        latitude: coordinates?.lat ?? null,
+        longitude: coordinates?.lng ?? null,
+      };
+
+      const { data, error: upsertError } = await supabase
+        .from("knock_potential_leads")
+        .upsert(payload, { onConflict: "rep_id,address_normalized" })
+        .select("id,rep_id,address,address_normalized,homeowner_name,notes,latitude,longitude,created_at")
+        .single();
+
+      if (upsertError || !data) {
+        throw new Error(upsertError?.message || "Could not save potential lead.");
+      }
+
+      const saved = data as PotentialLeadRow;
+      setPotentialLeads((previous) => [saved, ...previous.filter((row) => row.id !== saved.id)]);
+      setPotentialLeadDraft(DEFAULT_POTENTIAL_LEAD_DRAFT);
+      setPotentialLeadMessage("Potential lead saved. It will show on Doors Map.");
+    } catch (saveError) {
+      setPotentialLeadError(parseError(saveError, "Could not save potential lead."));
+    } finally {
+      setSavingPotentialLead(false);
+    }
+  }
+
+  async function removePotentialLead(leadId: string) {
+    setDeletingPotentialLeadId(leadId);
+    setPotentialLeadError(null);
+    setPotentialLeadMessage("");
+
+    try {
+      const { error: deleteError } = await supabase
+        .from("knock_potential_leads")
+        .delete()
+        .eq("id", leadId);
+
+      if (deleteError) {
+        throw new Error(deleteError.message);
+      }
+
+      setPotentialLeads((previous) => previous.filter((lead) => lead.id !== leadId));
+      setPotentialLeadMessage("Potential lead removed.");
+    } catch (deleteError) {
+      setPotentialLeadError(parseError(deleteError, "Could not remove potential lead."));
+    } finally {
+      setDeletingPotentialLeadId(null);
+    }
+  }
 
   async function fillAddressFromLocation() {
     if (!navigator.geolocation) {
@@ -469,6 +812,10 @@ export default function KnockingPage() {
       }
 
       setSession(data as KnockSessionRow);
+      setSessionEvents([]);
+      setSessionEventsError(null);
+      setEditingEventId(null);
+      setEventEditDraft(null);
       setStep("door");
       setMessage("Knocking session started.");
     } catch (e) {
@@ -561,6 +908,10 @@ export default function KnockingPage() {
       if (updateError) throw new Error(updateError.message);
 
       setSession(null);
+      setSessionEvents([]);
+      setSessionEventsError(null);
+      setEditingEventId(null);
+      setEventEditDraft(null);
       setStep("door");
       setSessionSeconds(0);
       setMessage("Session ended.");
@@ -743,8 +1094,9 @@ export default function KnockingPage() {
           : {},
       };
 
-      const [{ error: insertError }, { data: updatedSession, error: sessionError }] = await Promise.all([
-        supabase.from("knock_events").insert(eventPayload),
+      const [{ data: insertedEvent, error: insertError }, { data: updatedSession, error: sessionError }] =
+        await Promise.all([
+          supabase.from("knock_events").insert(eventPayload).select(KNOCK_EVENT_SELECT).single(),
         supabase
           .from("knock_sessions")
           .update({
@@ -760,12 +1112,16 @@ export default function KnockingPage() {
           .eq("id", session.id)
           .select("*")
           .single(),
-      ]);
+        ]);
 
       if (insertError) throw new Error(insertError.message);
       if (sessionError) throw new Error(sessionError.message);
       if (updatedSession) {
         setSession(updatedSession as KnockSessionRow);
+      }
+      if (insertedEvent) {
+        const inserted = insertedEvent as SessionKnockEventRow;
+        setSessionEvents((previous) => [inserted, ...previous.filter((row) => row.id !== inserted.id)]);
       }
 
       if (includeInNightlyNumbers) {
@@ -874,6 +1230,97 @@ export default function KnockingPage() {
           {error ? <p className="error">{error}</p> : null}
           {message ? <p className="hint">{message}</p> : null}
         </section>
+
+        <section className="panel">
+          <div className="row">
+            <h2 style={{ margin: 0 }}>Potential Leads For Doors Map</h2>
+            <p className="hint">{potentialLeads.length} saved</p>
+          </div>
+          <p className="hint">
+            Add addresses here to display as potential leads on the Doors Map without creating a job.
+          </p>
+
+          <form className="stack" onSubmit={addPotentialLead}>
+            <label className="stack">
+              Address *
+              <AddressAutocompleteInput
+                value={potentialLeadDraft.address}
+                onChange={(address) =>
+                  setPotentialLeadDraft((previous) => ({ ...previous, address }))
+                }
+                apiKey={geocodeApiKey}
+                placeholder="123 Main St, City, ST ZIP"
+                required
+                showStatus
+              />
+            </label>
+
+            <label className="stack">
+              Homeowner Name (optional)
+              <input
+                value={potentialLeadDraft.homeownerName}
+                onChange={(event) =>
+                  setPotentialLeadDraft((previous) => ({ ...previous, homeownerName: event.target.value }))
+                }
+                placeholder="Jane Doe"
+              />
+            </label>
+
+            <label className="stack">
+              Notes (optional)
+              <textarea
+                rows={2}
+                value={potentialLeadDraft.notes}
+                onChange={(event) =>
+                  setPotentialLeadDraft((previous) => ({ ...previous, notes: event.target.value }))
+                }
+                placeholder="Any quick context about this lead"
+              />
+            </label>
+
+            <div className="row">
+              <button type="submit" disabled={savingPotentialLead}>
+                {savingPotentialLead ? "Saving..." : "Save Potential Lead"}
+              </button>
+            </div>
+          </form>
+
+          {potentialLeadError ? <p className="error">{potentialLeadError}</p> : null}
+          {potentialLeadMessage ? <p className="hint">{potentialLeadMessage}</p> : null}
+          {loadingPotentialLeads ? <p className="hint">Loading potential leads...</p> : null}
+
+          {potentialLeads.length > 0 ? (
+            <div className="jobs">
+              {potentialLeads.slice(0, 12).map((lead) => (
+                <article key={lead.id} className="job-card">
+                  <div className="row">
+                    <strong>{lead.address}</strong>
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => void removePotentialLead(lead.id)}
+                      disabled={deletingPotentialLeadId === lead.id}
+                    >
+                      {deletingPotentialLeadId === lead.id ? "Removing..." : "Remove"}
+                    </button>
+                  </div>
+                  <p className="hint">
+                    {typeof lead.homeowner_name === "string" && lead.homeowner_name.trim().length > 0
+                      ? `Homeowner: ${lead.homeowner_name}`
+                      : "Homeowner: -"}
+                  </p>
+                  {typeof lead.notes === "string" && lead.notes.trim().length > 0 ? (
+                    <p className="muted">{lead.notes}</p>
+                  ) : null}
+                  <p className="hint">Added: {lead.created_at ? new Date(lead.created_at).toLocaleString() : "-"}</p>
+                </article>
+              ))}
+              {potentialLeads.length > 12 ? (
+                <p className="hint">Showing first 12 of {potentialLeads.length} potential leads.</p>
+              ) : null}
+            </div>
+          ) : null}
+        </section>
       </AppShell>
     );
   }
@@ -882,33 +1329,32 @@ export default function KnockingPage() {
 
   return (
     <main className="knock-screen">
-      <header className="knock-header">
-        <div>
-          <h1>Knocking Session</h1>
-          <p>
-            {sessionStatusLabel} | {formatDuration(sessionSeconds)}
-          </p>
-        </div>
-        <div className="knock-header-actions">
-          <Link href="/jobs" className="knock-link-btn">
-            Exit View
-          </Link>
-          {isActive ? (
-            <button className="secondary" onClick={pauseSession} disabled={saving}>
-              Pause
-            </button>
-          ) : (
-            <button className="secondary" onClick={resumeSession} disabled={saving}>
-              Resume
-            </button>
-          )}
-          <button className="danger" onClick={endSession} disabled={saving}>
-            End
-          </button>
-        </div>
-      </header>
-
       <section className="knock-card">
+        <div className="row">
+          <div>
+            <h1 style={{ margin: 0, fontSize: "1.2rem" }}>Knocking Session</h1>
+            <p className="knock-rep">
+              {sessionStatusLabel} | {formatDuration(sessionSeconds)}
+            </p>
+          </div>
+          <div className="knock-header-actions">
+            <Link href="/jobs" className="knock-link-btn">
+              Exit View
+            </Link>
+            {isActive ? (
+              <button className="secondary" onClick={pauseSession} disabled={saving}>
+                Pause
+              </button>
+            ) : (
+              <button className="secondary" onClick={resumeSession} disabled={saving}>
+                Resume
+              </button>
+            )}
+            <button className="danger" onClick={endSession} disabled={saving}>
+              End
+            </button>
+          </div>
+        </div>
         <p className="knock-rep">Rep: {fullName || user.email || user.id}</p>
         <p className="knock-rep">
           Today: K {todayTotals.knocks} | T {todayTotals.talks} | I {todayTotals.inspections} | C {" "}
@@ -934,14 +1380,17 @@ export default function KnockingPage() {
             <h2>At This Door</h2>
             <label className="stack">
               Address
-              <input
+              <AddressAutocompleteInput
                 value={doorAddress}
-                onChange={(e) => {
+                onChange={(nextAddress) => {
                   addressTouchedRef.current = true;
-                  setDoorAddress(e.target.value);
-                  setHomeownerIntake((prev) => ({ ...prev, address: e.target.value }));
+                  setDoorAddress(nextAddress);
+                  setHomeownerIntake((prev) => ({ ...prev, address: nextAddress }));
                 }}
+                apiKey={geocodeApiKey}
                 placeholder={currentAddress || "Tap location to fill"}
+                ariaLabel="Door address"
+                disabled={saving || locating}
               />
             </label>
             <button className="secondary" onClick={fillAddressFromLocation} disabled={locating || saving}>
@@ -1011,9 +1460,14 @@ export default function KnockingPage() {
             </label>
             <label className="stack">
               Address
-              <input
-                value={homeownerIntake.address || doorAddress}
-                onChange={(e) => setHomeownerIntake((prev) => ({ ...prev, address: e.target.value }))}
+              <AddressAutocompleteInput
+                value={homeownerIntake.address}
+                onChange={(nextAddress) =>
+                  setHomeownerIntake((prev) => ({ ...prev, address: nextAddress }))
+                }
+                apiKey={geocodeApiKey}
+                placeholder={doorAddress || currentAddress || "Address"}
+                ariaLabel="Homeowner address"
               />
             </label>
             <button type="submit">Continue</button>
@@ -1126,6 +1580,164 @@ export default function KnockingPage() {
             <button type="button" className="secondary" onClick={() => setStep("homeowner")}>Back</button>
           </form>
         ) : null}
+      </section>
+
+      <section className="knock-card">
+        <div className="row">
+          <h2 style={{ margin: 0 }}>Session Knocks</h2>
+          <p className="hint">{sessionEvents.length} logged</p>
+        </div>
+        <p className="hint">
+          Edit unlocked knocks while this session is active or paused. After the session ends, edits are locked.
+        </p>
+        {sessionEventsError ? <p className="error">{sessionEventsError}</p> : null}
+        {loadingSessionEvents ? <p className="hint">Loading session knocks...</p> : null}
+
+        <div className="grid knock-events-list">
+          {sessionEvents.map((event) => {
+            const isEditing = editingEventId === event.id;
+            const canEdit = canEditEventRow(event);
+            const contactParts = [
+              typeof event.homeowner_name === "string" && event.homeowner_name.trim()
+                ? event.homeowner_name.trim()
+                : null,
+              typeof event.homeowner_phone === "string" && event.homeowner_phone.trim()
+                ? event.homeowner_phone.trim()
+                : null,
+              typeof event.homeowner_email === "string" && event.homeowner_email.trim()
+                ? event.homeowner_email.trim()
+                : null,
+            ].filter((value): value is string => Boolean(value));
+
+            return (
+              <article key={event.id} className="job-card knock-event-card">
+                <div className="row">
+                  <strong>{eventTitle(event.action, typeof event.outcome === "string" ? event.outcome : null)}</strong>
+                  <span className="hint">
+                    {event.created_at ? new Date(event.created_at).toLocaleString() : "-"}
+                  </span>
+                </div>
+
+                {isEditing && eventEditDraft ? (
+                  <form
+                    className="stack"
+                    onSubmit={(submitEvent) => {
+                      submitEvent.preventDefault();
+                      void saveEventEdits(event);
+                    }}
+                  >
+                    {event.action === "knock" ? (
+                      <label className="stack">
+                        Outcome
+                        <select
+                          value={eventEditDraft.outcome}
+                          onChange={(changeEvent) =>
+                            setEventEditDraft((previous) =>
+                              previous
+                                ? {
+                                    ...previous,
+                                    outcome: editableOutcome(changeEvent.target.value),
+                                  }
+                                : previous,
+                            )
+                          }
+                        >
+                          <option value="no_answer">No Answer</option>
+                          <option value="no">No</option>
+                        </select>
+                      </label>
+                    ) : null}
+
+                    <label className="stack">
+                      Address
+                      <AddressAutocompleteInput
+                        value={eventEditDraft.address}
+                        onChange={(nextAddress) =>
+                          setEventEditDraft((previous) =>
+                            previous ? { ...previous, address: nextAddress } : previous,
+                          )
+                        }
+                        apiKey={geocodeApiKey}
+                        ariaLabel="Edit event address"
+                        disabled={saving}
+                      />
+                    </label>
+
+                    <label className="stack">
+                      Homeowner Name
+                      <input
+                        value={eventEditDraft.homeownerName}
+                        onChange={(changeEvent) =>
+                          setEventEditDraft((previous) =>
+                            previous ? { ...previous, homeownerName: changeEvent.target.value } : previous,
+                          )
+                        }
+                      />
+                    </label>
+
+                    <label className="stack">
+                      Phone
+                      <input
+                        value={eventEditDraft.homeownerPhone}
+                        onChange={(changeEvent) =>
+                          setEventEditDraft((previous) =>
+                            previous ? { ...previous, homeownerPhone: changeEvent.target.value } : previous,
+                          )
+                        }
+                      />
+                    </label>
+
+                    <label className="stack">
+                      Email
+                      <input
+                        value={eventEditDraft.homeownerEmail}
+                        onChange={(changeEvent) =>
+                          setEventEditDraft((previous) =>
+                            previous ? { ...previous, homeownerEmail: changeEvent.target.value } : previous,
+                          )
+                        }
+                      />
+                    </label>
+
+                    <div className="row">
+                      <button type="submit" disabled={saving}>
+                        {saving ? "Saving..." : "Save Edit"}
+                      </button>
+                      <button type="button" className="secondary" onClick={cancelEditingEvent} disabled={saving}>
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <>
+                    <p className="muted">
+                      {typeof event.address === "string" && event.address.trim() ? event.address : "No address"}
+                    </p>
+                    <p className="hint">
+                      {contactParts.length > 0 ? contactParts.join(" | ") : "No homeowner/contact info"}
+                    </p>
+                    <div className="row">
+                      {canEdit ? (
+                        <button className="secondary" onClick={() => beginEditingEvent(event)} disabled={saving}>
+                          Edit
+                        </button>
+                      ) : (
+                        <span className="hint">
+                          {eventIsCrmLocked(event)
+                            ? "Locked after CRM link"
+                            : "Editing locked outside active session"}
+                        </span>
+                      )}
+                    </div>
+                  </>
+                )}
+              </article>
+            );
+          })}
+          {!loadingSessionEvents && sessionEvents.length === 0 ? (
+            <p className="hint">No knocks logged in this session yet.</p>
+          ) : null}
+        </div>
       </section>
     </main>
   );

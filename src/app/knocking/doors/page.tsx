@@ -22,11 +22,22 @@ type KnockEventRow = JsonRecord & {
   linked_job_id?: string | null;
 };
 
+type PotentialLeadRow = JsonRecord & {
+  id: string;
+  rep_id: string;
+  address?: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  created_at?: string | null;
+  homeowner_name?: string | null;
+};
+
 type DoorPin = {
   address: string;
   lat: number | null;
   lng: number | null;
   knocks: number;
+  potentialLeadCount: number;
   lastKnockedAt: string | null;
   lastOutcome: string | null;
   lastHomeownerName: string | null;
@@ -154,6 +165,10 @@ export default function KnockingDoorsPage() {
     () => pins.filter((pin) => pin.lat !== null && pin.lng !== null),
     [pins],
   );
+  const potentialLeadAddresses = useMemo(
+    () => pins.filter((pin) => pin.potentialLeadCount > 0).length,
+    [pins],
+  );
 
   useEffect(() => {
     if (!loading && !user) {
@@ -169,27 +184,42 @@ export default function KnockingDoorsPage() {
       setLoadingPins(true);
       setDataError(null);
 
-      const { data, error: queryError } = await supabase
-        .from("knock_events")
-        .select(
-          "id,rep_id,address,latitude,longitude,created_at,outcome,homeowner_name,contingencies_delta,linked_job_id",
-        )
-        .not("address", "is", null)
-        .order("created_at", { ascending: false })
-        .limit(5000);
+      const [eventsResult, potentialLeadsResult] = await Promise.all([
+        supabase
+          .from("knock_events")
+          .select(
+            "id,rep_id,address,latitude,longitude,created_at,outcome,homeowner_name,contingencies_delta,linked_job_id",
+          )
+          .not("address", "is", null)
+          .order("created_at", { ascending: false })
+          .limit(5000),
+        supabase
+          .from("knock_potential_leads")
+          .select("id,rep_id,address,latitude,longitude,created_at,homeowner_name")
+          .not("address", "is", null)
+          .order("created_at", { ascending: false })
+          .limit(5000),
+      ]);
 
       if (!active) return;
 
-      if (queryError) {
-        setDataError(queryError.message);
+      if (eventsResult.error) {
+        setDataError(eventsResult.error.message);
         setPins([]);
         setLoadingPins(false);
         return;
       }
 
+      const dataWarnings: string[] = [];
+      if (potentialLeadsResult.error) {
+        dataWarnings.push(
+          `Potential leads unavailable: ${potentialLeadsResult.error.message}`,
+        );
+      }
+
       const grouped = new Map<string, DoorPinAggregate>();
 
-      ((data ?? []) as KnockEventRow[]).forEach((row) => {
+      ((eventsResult.data ?? []) as KnockEventRow[]).forEach((row) => {
         const address = typeof row.address === "string" ? row.address.trim() : "";
         if (!address) return;
 
@@ -208,6 +238,7 @@ export default function KnockingDoorsPage() {
             lat,
             lng,
             knocks: 1,
+            potentialLeadCount: 0,
             lastKnockedAt: typeof row.created_at === "string" ? row.created_at : null,
             lastOutcome: typeof row.outcome === "string" ? row.outcome : null,
             lastHomeownerName: typeof row.homeowner_name === "string" ? row.homeowner_name : null,
@@ -241,6 +272,48 @@ export default function KnockingDoorsPage() {
           existing.hasContingencyEvent = true;
         }
       });
+
+      if (!potentialLeadsResult.error) {
+        ((potentialLeadsResult.data ?? []) as PotentialLeadRow[]).forEach((lead) => {
+          const address = typeof lead.address === "string" ? lead.address.trim() : "";
+          if (!address) return;
+
+          const key = normalizeAddress(address);
+          if (!key) return;
+
+          const lat = toNumber(lead.latitude);
+          const lng = toNumber(lead.longitude);
+          const homeownerName = toNonEmptyString(lead.homeowner_name);
+
+          const existing = grouped.get(key);
+          if (!existing) {
+            grouped.set(key, {
+              address,
+              lat,
+              lng,
+              knocks: 0,
+              potentialLeadCount: 1,
+              lastKnockedAt: typeof lead.created_at === "string" ? lead.created_at : null,
+              lastOutcome: "potential_lead",
+              lastHomeownerName: homeownerName,
+              repCount: 1,
+              repIds: new Set([String(lead.rep_id)]),
+              linkedJobIds: new Set<string>(),
+              hasContingencyEvent: false,
+            });
+            return;
+          }
+
+          existing.potentialLeadCount += 1;
+          if (existing.lat === null && lat !== null) existing.lat = lat;
+          if (existing.lng === null && lng !== null) existing.lng = lng;
+          if (!existing.lastHomeownerName && homeownerName) {
+            existing.lastHomeownerName = homeownerName;
+          }
+          existing.repIds.add(String(lead.rep_id));
+          existing.repCount = existing.repIds.size;
+        });
+      }
 
       let contingencyJobIds = new Set<string>();
       const allLinkedJobIds = Array.from(
@@ -315,6 +388,7 @@ export default function KnockingDoorsPage() {
       });
 
       setPins(merged);
+      setDataError(dataWarnings.length > 0 ? dataWarnings.join(" | ") : null);
       setLoadingPins(false);
     };
 
@@ -419,9 +493,9 @@ export default function KnockingDoorsPage() {
         content: `
           <div style="font-family: system-ui; min-width: 220px;">
             <strong>${pin.address}</strong><br/>
-            <span>Knocks: ${pin.knocks}</span><br/>
-            <span>Last: ${formatDateTime(pin.lastKnockedAt)}</span><br/>
-            <span>Outcome: ${pin.lastOutcome ?? "-"}</span><br/>
+            <span>${pin.knocks > 0 ? `Knocks: ${pin.knocks}` : `Potential leads: ${pin.potentialLeadCount}`}</span><br/>
+            <span>Last activity: ${formatDateTime(pin.lastKnockedAt)}</span><br/>
+            <span>Outcome: ${pin.knocks > 0 ? pin.lastOutcome ?? "-" : "potential_lead"}</span><br/>
             <span>Homeowner: ${pin.lastHomeownerName ?? "-"}</span>
           </div>
         `,
@@ -451,13 +525,13 @@ export default function KnockingDoorsPage() {
         <div className="row">
           <h2 style={{ margin: 0 }}>Knocked Doors Map</h2>
           <p className="hint">
-            {pins.length} addresses | {locatedPins.length} pinned
+            {pins.length} addresses | {locatedPins.length} pinned | {potentialLeadAddresses} potential leads
           </p>
         </div>
         <p className="hint">
           {managerView
-            ? "Manager view: all doors knocked through the app."
-            : "Rep view: only doors you knocked through the app."}
+            ? "Manager view: all knocked doors and potential leads entered through the app."
+            : "Rep view: only your knocked doors and your potential leads entered through the app."}
         </p>
 
         {loadingPins ? <p className="hint">Loading knocked doors...</p> : null}
@@ -473,9 +547,11 @@ export default function KnockingDoorsPage() {
               <article key={normalizeAddress(pin.address)} className="job-card">
                 <div className="row">
                   <strong>{pin.address}</strong>
-                  <span className="hint">{pin.knocks} knock(s)</span>
+                  <span className="hint">
+                    {pin.knocks > 0 ? `${pin.knocks} knock(s)` : `${pin.potentialLeadCount} potential lead(s)`}
+                  </span>
                 </div>
-                <p className="hint">Last knock: {formatDateTime(pin.lastKnockedAt)}</p>
+                <p className="hint">Last activity: {formatDateTime(pin.lastKnockedAt)}</p>
               </article>
             ))}
             {pins.length > 12 ? <p className="hint">Showing first 12 of {pins.length} addresses.</p> : null}

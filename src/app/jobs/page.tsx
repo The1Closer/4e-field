@@ -130,7 +130,7 @@ export default function JobsPage() {
   const [nearbyJobs, setNearbyJobs] = useState<NearbyJob[]>([]);
   const [jobsForNearby, setJobsForNearby] = useState<JobRecord[]>([]);
   const [todaysTasks, setTodaysTasks] = useState<TaskRecord[]>([]);
-  const [radiusMiles, setRadiusMiles] = useState<3 | 5>(5);
+  const [radiusMiles, setRadiusMiles] = useState(5);
   const [location, setLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [locationError, setLocationError] = useState<string | null>(null);
   const [nearbyError, setNearbyError] = useState<string | null>(null);
@@ -449,99 +449,110 @@ export default function JobsPage() {
         </div>
       </section>
 
-      <section className="panel">
-        <div className="row">
-          <h2 style={{ margin: 0 }}>Nearby Jobs</h2>
+      <div className="jobs-home-columns">
+        <section className="panel">
           <div className="row">
-            <button
-              className={radiusMiles === 3 ? "" : "secondary"}
-              onClick={() => setRadiusMiles(3)}
-            >
-              3 miles
-            </button>
-            <button
-              className={radiusMiles === 5 ? "" : "secondary"}
-              onClick={() => setRadiusMiles(5)}
-            >
-              5 miles
-            </button>
+            <h2 style={{ margin: 0 }}>Nearby Jobs</h2>
+            <p className="hint">{nearbyJobs.length} matches</p>
           </div>
-        </div>
-        <p className="hint">
-          Showing jobs by homeowner address near your current location.
-        </p>
-        {locationError ? <p className="error">{locationError}</p> : null}
-        {nearbyError ? <p className="error">{nearbyError}</p> : null}
-        {loadingNearby ? <p className="hint">Finding nearby jobs...</p> : null}
-        <div className="grid">
-          {nearbyJobs.map((job) => (
-            <article key={job.id} className="job-card">
-              <div className="row">
-                <strong>{job.homeownerName}</strong>
-                <span className="hint">
-                  {Number.isFinite(job.distanceMiles)
-                    ? `${job.distanceMiles.toFixed(1)} mi`
-                    : "Distance unavailable"}
-                </span>
-              </div>
-              <p className="muted">{job.addressLine}</p>
-              <p className="hint">
-                {job.phone ? <a href={`tel:${job.phone}`}>{job.phone}</a> : "No phone"} |{" "}
-                {job.email ? <a href={`mailto:${job.email}`}>{job.email}</a> : "No email"}
-              </p>
-              <Link className="tab" href={`/jobs/${job.id}`}>
-                Open Job
-              </Link>
-            </article>
-          ))}
-          {!loadingNearby && nearbyJobs.length === 0 ? (
-            <p className="hint">
-              No jobs found in the selected range yet.
-            </p>
-          ) : null}
-        </div>
-      </section>
-
-      <section className="panel">
-        <div className="row">
-          <h2 style={{ margin: 0 }}>Today&apos;s Tasks & Appointments</h2>
-          <p className="hint">{todaysTasks.length} items</p>
-        </div>
-        <div className="grid">
-          {todaysTasks.map((task) => {
-            const status = typeof task.status === "string" ? task.status : "open";
-            const date =
-              (typeof task.scheduled_for === "string" ? task.scheduled_for : null) ??
-              (typeof task.due_at === "string" ? task.due_at : null);
-            const taskJob =
-              typeof task.job === "object" && task.job ? (task.job as Record<string, unknown>) : null;
-            const homeownerName =
-              typeof taskJob?.homeowner_name === "string" && taskJob.homeowner_name.trim().length > 0
-                ? taskJob.homeowner_name
-                : "General task";
-            const address =
-              typeof taskJob?.address === "string" && taskJob.address.trim().length > 0
-                ? taskJob.address
-                : "No address";
-
-            return (
-              <article key={task.id} className="job-card">
+          <div className="nearby-radius-control">
+            <label htmlFor="nearby-radius-slider" className="hint nearby-radius-label">
+              Radius: {radiusMiles} {radiusMiles === 1 ? "mile" : "miles"}
+            </label>
+            <input
+              id="nearby-radius-slider"
+              type="range"
+              min={1}
+              max={5}
+              step={1}
+              value={radiusMiles}
+              onChange={(event) => setRadiusMiles(Number(event.target.value))}
+              aria-label="Nearby jobs radius in miles"
+            />
+            <div className="nearby-radius-markers" aria-hidden="true">
+              <span>1</span>
+              <span>2</span>
+              <span>3</span>
+              <span>4</span>
+              <span>5</span>
+            </div>
+          </div>
+          <p className="hint">
+            Showing jobs by homeowner address near your current location.
+          </p>
+          {locationError ? <p className="error">{locationError}</p> : null}
+          {nearbyError ? <p className="error">{nearbyError}</p> : null}
+          {loadingNearby ? <p className="hint">Finding nearby jobs...</p> : null}
+          <div className="grid nearby-jobs-scroll">
+            {nearbyJobs.map((job) => (
+              <article key={job.id} className="job-card nearby-job-card">
                 <div className="row">
-                  <strong>{task.title ? String(task.title) : "Untitled task"}</strong>
-                  <StatusPill value={status} />
+                  <strong>{job.homeownerName}</strong>
+                  <span className="hint">
+                    {Number.isFinite(job.distanceMiles)
+                      ? `${job.distanceMiles.toFixed(1)} mi`
+                      : "Distance unavailable"}
+                  </span>
                 </div>
-                <p className="muted">
-                  {homeownerName} | {address}
+                <p className="muted">{job.addressLine}</p>
+                <p className="hint">
+                  {job.phone ? <a href={`tel:${job.phone}`}>{job.phone}</a> : "No phone"} |{" "}
+                  {job.email ? <a href={`mailto:${job.email}`}>{job.email}</a> : "No email"}
                 </p>
-                <p className="hint">{formatDate(date)}</p>
+                <Link className="tab" href={`/jobs/${job.id}`}>
+                  Open Job
+                </Link>
               </article>
-            );
-          })}
-          {!loadingHome && todaysTasks.length === 0 ? (
-            <p className="hint">No tasks or appointments scheduled for today.</p>
-          ) : null}
-        </div>
-      </section>
+            ))}
+            {!loadingNearby && nearbyJobs.length === 0 ? (
+              <p className="hint">
+                No jobs found in the selected range yet.
+              </p>
+            ) : null}
+          </div>
+        </section>
+
+        <section className="panel">
+          <div className="row">
+            <h2 style={{ margin: 0 }}>Today&apos;s Tasks & Appointments</h2>
+            <p className="hint">{todaysTasks.length} items</p>
+          </div>
+          <div className="grid">
+            {todaysTasks.map((task) => {
+              const status = typeof task.status === "string" ? task.status : "open";
+              const date =
+                (typeof task.scheduled_for === "string" ? task.scheduled_for : null) ??
+                (typeof task.due_at === "string" ? task.due_at : null);
+              const taskJob =
+                typeof task.job === "object" && task.job ? (task.job as Record<string, unknown>) : null;
+              const homeownerName =
+                typeof taskJob?.homeowner_name === "string" && taskJob.homeowner_name.trim().length > 0
+                  ? taskJob.homeowner_name
+                  : "General task";
+              const address =
+                typeof taskJob?.address === "string" && taskJob.address.trim().length > 0
+                  ? taskJob.address
+                  : "No address";
+
+              return (
+                <article key={task.id} className="job-card">
+                  <div className="row">
+                    <strong>{task.title ? String(task.title) : "Untitled task"}</strong>
+                    <StatusPill value={status} />
+                  </div>
+                  <p className="muted">
+                    {homeownerName} | {address}
+                  </p>
+                  <p className="hint">{formatDate(date)}</p>
+                </article>
+              );
+            })}
+            {!loadingHome && todaysTasks.length === 0 ? (
+              <p className="hint">No tasks or appointments scheduled for today.</p>
+            ) : null}
+          </div>
+        </section>
+      </div>
 
       {error ? <p className="error">{error}</p> : null}
     </AppShell>
