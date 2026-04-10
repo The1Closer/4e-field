@@ -10,6 +10,8 @@ import type { UserRole } from "@/types/models";
 
 type Props = {
   role: UserRole | null;
+  profileName?: string | null;
+  profileImageUrl?: string | null;
   onSignOut: () => Promise<void>;
   debug?: {
     userId: string | null;
@@ -47,7 +49,7 @@ function isActivityPath(pathname: string) {
   return pathname === "/notifications" || pathname === "/tasks";
 }
 
-export function AppShell({ role, onSignOut, debug, children }: Props) {
+export function AppShell({ role, profileName, profileImageUrl, onSignOut, debug, children }: Props) {
   const pathname = usePathname();
   const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -58,6 +60,7 @@ export function AppShell({ role, onSignOut, debug, children }: Props) {
     role === "sales_manager" ||
     role === "production_manager" ||
     role === "social_media_coordinator";
+  const displayProfileName = profileName?.trim() || "User";
 
   const items = useMemo(
     () => (managerLike ? [...navItems, { href: "/knocking/live", label: "Management" }] : navItems),
@@ -113,15 +116,14 @@ export function AppShell({ role, onSignOut, debug, children }: Props) {
                 <Image
                   src="/4ELogo.png"
                   alt="CRM logo"
-                  width={38}
-                  height={38}
+                  width={50}
+                  height={50}
                   className="shell-brand-logo"
                   priority
                 />
               </span>
               <span className="shell-brand-text">
-                <strong>Field</strong>
-                <span className="muted">Role: {roleLabel(role)}</span>
+                <strong>4E Field App</strong>
               </span>
             </Link>
           </div>
@@ -136,6 +138,27 @@ export function AppShell({ role, onSignOut, debug, children }: Props) {
               <span aria-hidden="true">🔔</span>
             </Link>
             <ThemeToggle />
+            <div className="profile-chip" aria-label={`${displayProfileName} ${roleLabel(role)}`}>
+              <span className="profile-avatar">
+                {profileImageUrl ? (
+                  <img
+                    src={profileImageUrl}
+                    alt="Profile picture"
+                    className="profile-avatar-image"
+                    referrerPolicy="no-referrer"
+                  />
+                ) : (
+                  <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+                    <circle cx="12" cy="8" r="3.5" />
+                    <path d="M5 19a7 7 0 0 1 14 0" />
+                  </svg>
+                )}
+              </span>
+              <span className="profile-chip-text">
+                <strong className="profile-name">{displayProfileName}</strong>
+                <span className="muted profile-role">{roleLabel(role)}</span>
+              </span>
+            </div>
             <button
               className="secondary"
               onClick={async () => {

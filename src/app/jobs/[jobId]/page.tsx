@@ -109,7 +109,16 @@ export default function JobDetailPage() {
   const jobId = params.jobId;
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const { user, loading, role, signOut, accessToken, error: authError } = useAuthSession();
+  const {
+    user,
+    loading,
+    role,
+    signOut,
+    accessToken,
+    error: authError,
+    profileImageUrl,
+    fullName,
+  } = useAuthSession();
   const [supabaseReady, setSupabaseReady] = useState(false);
 
   const [job, setJob] = useState<JobRecord | null>(null);
@@ -372,6 +381,8 @@ export default function JobDetailPage() {
   return (
     <AppShell
       role={role}
+      profileName={fullName}
+      profileImageUrl={profileImageUrl}
       onSignOut={signOut}
       debug={{
         userId: user.id,

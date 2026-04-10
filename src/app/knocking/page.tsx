@@ -7,6 +7,12 @@ import AddressAutocompleteInput from "@/components/AddressAutocompleteInput";
 import { AppShell } from "@/components/AppShell";
 import { crmApi } from "@/lib/crm-api";
 import {
+  countSyncOperations,
+  enqueueSyncOperation,
+  flushSyncQueue,
+  setupAutoSync,
+} from "@/lib/offline-sync";
+import {
   getEventDelta,
   getSessionElapsedSeconds,
   getTodayLocalDate,
@@ -17,6 +23,17 @@ import {
 } from "@/lib/knocking";
 import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 import { useAuthSession } from "@/lib/use-auth-session";
+import type { AreaSuggestion, SessionFeedback } from "@/types/field-intelligence";
+import {
+  COMPONENT_PRESENCE_KEYS,
+  REQUIRED_PHOTO_COUNTS,
+  defaultComponentPresenceDraft,
+  type CaptureSection,
+  type DamageSlope,
+  type DamageCause,
+  type InspectionPhotoDraft,
+  type InspectionStepKey,
+} from "@/types/inspection";
 import type { JsonRecord } from "@/types/models";
 
 type KnockSessionRow = JsonRecord & {
@@ -92,6 +109,74 @@ type PotentialLeadDraft = {
   notes: string;
 };
 
+type ReportSectionSelection = {
+  homeowner: boolean;
+  perimeterPhotos: boolean;
+  collateralDamage: boolean;
+  roofOverview: boolean;
+  roofComponents: boolean;
+  roofDamage: boolean;
+  interiorAttic: boolean;
+  signature: boolean;
+  summaryNotes: boolean;
+};
+
+type QuickPhotoDraft = {
+  file: File | null;
+  damageCause: DamageCause;
+  slopeTag: DamageSlope | "";
+  componentTag: string;
+  customTag: string;
+  note: string;
+};
+
+type RepSignatureRow = JsonRecord & {
+  id: string;
+  rep_id: string;
+  label?: string | null;
+  file_path: string;
+  is_active?: boolean | null;
+  created_at?: string | null;
+};
+
+type InspectionCompletionModalState = {
+  open: boolean;
+  eventAddress: string;
+  title: string;
+  reportId: string | null;
+  fileName: string;
+  pdfUrl: string | null;
+  pdfBytes: ArrayBuffer | null;
+  uploadStatus: "uploaded" | "failed";
+  uploadError: string | null;
+  linkedJobId: string | null;
+  inspectionId: string | null;
+  selectedPhotoIds: string[];
+  reportPayload: Record<string, unknown>;
+};
+
+type InspectionChecklist = {
+  shingleLengthInches: string;
+  shingleWidthInches: string;
+  dripEdgePresent: boolean | null;
+  notes: string;
+  contingent: boolean;
+  interiorStatus: "completed" | "skipped";
+  interiorSkipReason: string;
+  atticStatus: "completed" | "skipped";
+  atticSkipReason: string;
+  componentPresence: ReturnType<typeof defaultComponentPresenceDraft>;
+  signatureRepName: string;
+  selectedSignatureId: string | null;
+};
+
+type InspectionFlowStep = {
+  key: InspectionStepKey;
+  label: string;
+  description: string;
+  optional?: boolean;
+};
+
 const DEFAULT_INTAKE: HomeownerIntake = {
   homeownerName: "",
   phone: "",
@@ -99,13 +184,73 @@ const DEFAULT_INTAKE: HomeownerIntake = {
   address: "",
 };
 
-const DEFAULT_CHECKLIST = {
-  roofAge: "",
-  visibleDamage: "",
-  insuranceCarrier: "",
-  notes: "",
-  contingent: false,
+const INSPECTION_FLOW: InspectionFlowStep[] = [
+  {
+    key: "perimeter_photos",
+    label: "Perimeter Photos",
+    description: "Capture perimeter photos quickly in bulk.",
+  },
+  {
+    key: "collateral_damage",
+    label: "Collateral Damage",
+    description: "Capture one collateral-damage photo at a time with optional tags.",
+  },
+  {
+    key: "roof_overview",
+    label: "Roof Overview",
+    description: "Capture overview photos, layer photo, shingle dimensions, and drip-edge status.",
+  },
+  {
+    key: "roof_components",
+    label: "Roof Components",
+    description: "Mark component presence and quantity.",
+  },
+  {
+    key: "roof_damage",
+    label: "Roof Damage",
+    description: "Capture one roof-damage photo at a time with optional slope and damage tags.",
+  },
+  {
+    key: "interior_attic",
+    label: "Interior + Attic",
+    description: "Single page for interior and attic completion/skip status.",
+    optional: true,
+  },
+  {
+    key: "report_signature",
+    label: "Report Design + Signature",
+    description: "Choose report contents and apply a saved or drawn signature.",
+  },
+];
+
+const DEFAULT_REPORT_SECTION_SELECTION: ReportSectionSelection = {
+  homeowner: true,
+  perimeterPhotos: false,
+  collateralDamage: false,
+  roofOverview: true,
+  roofComponents: false,
+  roofDamage: true,
+  interiorAttic: false,
+  signature: true,
+  summaryNotes: true,
 };
+
+function makeDefaultChecklist(): InspectionChecklist {
+  return {
+    shingleLengthInches: "",
+    shingleWidthInches: "",
+    dripEdgePresent: null,
+    notes: "",
+    contingent: false,
+    interiorStatus: "completed",
+    interiorSkipReason: "",
+    atticStatus: "completed",
+    atticSkipReason: "",
+    componentPresence: defaultComponentPresenceDraft(),
+    signatureRepName: "",
+    selectedSignatureId: null,
+  };
+}
 
 const DEFAULT_POTENTIAL_LEAD_DRAFT: PotentialLeadDraft = {
   address: "",
@@ -142,6 +287,20 @@ function formatDuration(totalSeconds: number) {
 
 function parseError(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+function sanitizeFileName(fileName: string) {
+  return fileName.replace(/[^a-zA-Z0-9._-]+/g, "-");
+}
+
+function likelyNetworkError(error: unknown) {
+  const message = parseError(error, "").toLowerCase();
+  return (
+    message.includes("failed to fetch") ||
+    message.includes("network") ||
+    message.includes("timed out") ||
+    message.includes("offline")
+  );
 }
 
 function displayOutcome(value: string | null | undefined) {
@@ -261,6 +420,7 @@ export default function KnockingPage() {
     accessToken,
     error: authError,
     fullName,
+    profileImageUrl,
     includeInNightlyNumbers,
   } = useAuthSession();
   const supabase = getSupabaseBrowserClient();
@@ -296,18 +456,67 @@ export default function KnockingPage() {
 
   const [homeownerIntake, setHomeownerIntake] = useState<HomeownerIntake>(DEFAULT_INTAKE);
   const [followUpAt, setFollowUpAt] = useState("");
-  const [inspectionChecklist, setInspectionChecklist] = useState(DEFAULT_CHECKLIST);
-  const [inspectionPhotos, setInspectionPhotos] = useState<File[]>([]);
+  const [inspectionChecklist, setInspectionChecklist] = useState<InspectionChecklist>(makeDefaultChecklist());
+  const [inspectionPhotos, setInspectionPhotos] = useState<InspectionPhotoDraft[]>([]);
+  const [inspectionStepIndex, setInspectionStepIndex] = useState(0);
+  const [collateralPhotoDraft, setCollateralPhotoDraft] = useState<QuickPhotoDraft>({
+    file: null,
+    damageCause: "none",
+    slopeTag: "",
+    componentTag: "",
+    customTag: "",
+    note: "",
+  });
+  const [roofDamagePhotoDraft, setRoofDamagePhotoDraft] = useState<QuickPhotoDraft>({
+    file: null,
+    damageCause: "none",
+    slopeTag: "",
+    componentTag: "",
+    customTag: "",
+    note: "",
+  });
+  const [reportSectionSelection, setReportSectionSelection] = useState<ReportSectionSelection>(
+    DEFAULT_REPORT_SECTION_SELECTION,
+  );
+  const [reportPhotoSelection, setReportPhotoSelection] = useState<Record<string, boolean>>({});
+  const [repSignatures, setRepSignatures] = useState<RepSignatureRow[]>([]);
+  const [loadingSignatures, setLoadingSignatures] = useState(false);
+  const [savingSignature, setSavingSignature] = useState(false);
+  const [signatureDrawn, setSignatureDrawn] = useState(false);
+
+  const [syncQueueCount, setSyncQueueCount] = useState(0);
+  const [syncingNow, setSyncingNow] = useState(false);
+  const [syncStatusMessage, setSyncStatusMessage] = useState<string | null>(null);
+  const [suggestions, setSuggestions] = useState<AreaSuggestion[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [suggestionsError, setSuggestionsError] = useState<string | null>(null);
 
   const [saving, setSaving] = useState(false);
   const [locating, setLocating] = useState(false);
   const [locationError, setLocationError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [completionModal, setCompletionModal] = useState<InspectionCompletionModalState>({
+    open: false,
+    eventAddress: "",
+    title: "Inspection Report",
+    reportId: null,
+    fileName: "",
+    pdfUrl: null,
+    pdfBytes: null,
+    uploadStatus: "failed",
+    uploadError: null,
+    linkedJobId: null,
+    inspectionId: null,
+    selectedPhotoIds: [],
+    reportPayload: {},
+  });
 
   const watchIdRef = useRef<number | null>(null);
   const currentAddressRef = useRef("");
   const addressTouchedRef = useRef(false);
+  const signatureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const signatureDrawingRef = useRef(false);
 
   const geocodeApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
@@ -317,10 +526,640 @@ export default function KnockingPage() {
     if (!session) return "NOT STARTED";
     return session.status.toUpperCase();
   }, [session]);
+  const inspectionFlowStep = INSPECTION_FLOW[inspectionStepIndex] ?? INSPECTION_FLOW[0];
+
+  const sessionFeedback = useMemo<SessionFeedback>(() => {
+    const hours = Math.max(1 / 60, sessionSeconds / 3600);
+    const knocks = toNum(session?.knocks);
+    const talks = toNum(session?.talks);
+    const inspections = toNum(session?.inspections);
+    const contingencies = toNum(session?.contingencies);
+    return {
+      knocksPerHour: knocks / hours,
+      talkRate: knocks > 0 ? talks / knocks : 0,
+      inspectionRate: knocks > 0 ? inspections / knocks : 0,
+      contingencyRate: knocks > 0 ? contingencies / knocks : 0,
+    };
+  }, [session, sessionSeconds]);
+
+  const photoCountsBySection = useMemo(() => {
+    return inspectionPhotos.reduce(
+      (acc, photo) => {
+        acc[photo.captureSection] = (acc[photo.captureSection] ?? 0) + 1;
+        return acc;
+      },
+      {
+        perimeter_photos: 0,
+        collateral_damage: 0,
+        roof_overview: 0,
+        roof_damage: 0,
+        interior_attic: 0,
+        perimeter: 0,
+        roof: 0,
+        damage: 0,
+        interior: 0,
+        attic: 0,
+        other: 0,
+      } as Record<CaptureSection, number>,
+    );
+  }, [inspectionPhotos]);
+
+  const missingRequiredPhotos = useMemo(() => {
+    return {
+      perimeterPhotos: Math.max(
+        0,
+        REQUIRED_PHOTO_COUNTS.perimeterPhotos - photoCountsBySection.perimeter_photos,
+      ),
+      collateralDamage: Math.max(
+        0,
+        REQUIRED_PHOTO_COUNTS.collateralDamage - photoCountsBySection.collateral_damage,
+      ),
+      roofOverview: Math.max(0, REQUIRED_PHOTO_COUNTS.roofOverview - photoCountsBySection.roof_overview),
+      roofDamage: Math.max(0, REQUIRED_PHOTO_COUNTS.roofDamage - photoCountsBySection.roof_damage),
+    };
+  }, [photoCountsBySection]);
+
+  const photoRequirementWarnings = useMemo(() => {
+    const warnings: string[] = [];
+    if (missingRequiredPhotos.perimeterPhotos > 0) {
+      warnings.push(`perimeter photos missing: ${missingRequiredPhotos.perimeterPhotos}`);
+    }
+    if (missingRequiredPhotos.roofOverview > 0) {
+      warnings.push(`roof overview photos missing: ${missingRequiredPhotos.roofOverview}`);
+    }
+    if (missingRequiredPhotos.roofDamage > 0) {
+      warnings.push(`roof damage photos missing: ${missingRequiredPhotos.roofDamage}`);
+    }
+    return warnings;
+  }, [missingRequiredPhotos]);
+
+  async function refreshSyncQueueCount() {
+    try {
+      setSyncQueueCount(await countSyncOperations());
+    } catch {
+      // noop
+    }
+  }
+
+  async function queueOperation(
+    resourceType: string,
+    payload: Record<string, unknown>,
+    operationType: "insert" | "update" | "upsert" | "delete" = "insert",
+    resourceId?: string,
+  ) {
+    await enqueueSyncOperation({
+      clientOperationId: crypto.randomUUID(),
+      operationType,
+      resourceType,
+      resourceId: resourceId ?? null,
+      payload,
+    });
+    await refreshSyncQueueCount();
+  }
+
+  async function syncNow() {
+    setSyncingNow(true);
+    setSyncStatusMessage(null);
+    try {
+      const result = await flushSyncQueue();
+      setSyncStatusMessage(
+        result.offline
+          ? `Offline. ${result.remaining} queued operation(s) waiting.`
+          : `Synced ${result.pushed} operation(s). ${result.remaining} remaining.`,
+      );
+      await refreshSyncQueueCount();
+    } catch (syncError) {
+      setSyncStatusMessage(parseError(syncError, "Sync failed."));
+    } finally {
+      setSyncingNow(false);
+    }
+  }
+
+  function updateInspectionComponent(componentKey: string, isPresent: boolean) {
+    setInspectionChecklist((previous) => ({
+      ...previous,
+      componentPresence: {
+        ...previous.componentPresence,
+        [componentKey]: {
+          present: isPresent,
+          quantity: isPresent ? previous.componentPresence[componentKey]?.quantity ?? 1 : null,
+        },
+      },
+    }));
+  }
+
+  function updateInspectionComponentQuantity(componentKey: string, quantityText: string) {
+    const parsed = Number(quantityText);
+    setInspectionChecklist((previous) => ({
+      ...previous,
+      componentPresence: {
+        ...previous.componentPresence,
+        [componentKey]: {
+          ...previous.componentPresence[componentKey],
+          present: true,
+          quantity: Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0,
+        },
+      },
+    }));
+  }
+
+  function pushInspectionPhotos(
+    files: FileList | null,
+    options: {
+      captureSection: CaptureSection;
+      damageCause?: DamageCause;
+      slopeTag?: DamageSlope | "";
+      componentTag?: string;
+      customTag?: string;
+      note?: string;
+      autoTagged?: boolean;
+    },
+  ) {
+    const picked = Array.from(files ?? []);
+    if (picked.length === 0) return;
+
+    const nextPhotos = picked.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      captureSection: options.captureSection,
+      damageCause: options.damageCause ?? "none",
+      slopeTag: options.slopeTag ?? "",
+      componentTag: options.componentTag ?? "",
+      customTag: options.customTag ?? "",
+      note: options.note ?? "",
+      autoTagged: Boolean(options.autoTagged),
+    })) satisfies InspectionPhotoDraft[];
+
+    setInspectionPhotos((previous) => [...previous, ...nextPhotos]);
+    setReportPhotoSelection((previous) => ({
+      ...previous,
+      ...Object.fromEntries(nextPhotos.map((photo) => [photo.id, true])),
+    }));
+  }
+
+  function addQuickTaggedPhoto(draft: QuickPhotoDraft, captureSection: CaptureSection) {
+    if (!draft.file) {
+      setError("Select a photo before saving.");
+      return false;
+    }
+    const nextPhoto: InspectionPhotoDraft = {
+      id: crypto.randomUUID(),
+      file: draft.file,
+      captureSection,
+      damageCause: draft.damageCause,
+      slopeTag: draft.slopeTag,
+      componentTag: draft.componentTag,
+      customTag: draft.customTag,
+      note: draft.note,
+      autoTagged: false,
+    };
+    setInspectionPhotos((previous) => [...previous, nextPhoto]);
+    setReportPhotoSelection((previous) => ({
+      ...previous,
+      [nextPhoto.id]: true,
+    }));
+    return true;
+  }
+
+  async function loadRepSignatures() {
+    if (!user) return;
+    setLoadingSignatures(true);
+    try {
+      const { data, error: loadError } = await supabase
+        .from("rep_signatures")
+        .select("*")
+        .eq("rep_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(20);
+
+      if (loadError) {
+        throw new Error(loadError.message);
+      }
+      setRepSignatures((data ?? []) as RepSignatureRow[]);
+    } catch (loadError) {
+      setRepSignatures([]);
+      setError(parseError(loadError, "Could not load saved signatures."));
+    } finally {
+      setLoadingSignatures(false);
+    }
+  }
+
+  function drawOnSignatureCanvas(clientX: number, clientY: number) {
+    const canvas = signatureCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = clientX - rect.left;
+    const y = clientY - rect.top;
+    context.lineWidth = 2.2;
+    context.lineCap = "round";
+    context.lineJoin = "round";
+    context.strokeStyle = "#111";
+    context.lineTo(x, y);
+    context.stroke();
+    context.beginPath();
+    context.moveTo(x, y);
+    setSignatureDrawn(true);
+  }
+
+  function startSignatureStroke(event: any) {
+    const canvas = signatureCanvasRef.current;
+    if (!canvas) return;
+    signatureDrawingRef.current = true;
+    const context = canvas.getContext("2d");
+    if (context) {
+      context.beginPath();
+    }
+    drawOnSignatureCanvas(event.clientX, event.clientY);
+  }
+
+  function moveSignatureStroke(event: any) {
+    if (!signatureDrawingRef.current) return;
+    drawOnSignatureCanvas(event.clientX, event.clientY);
+  }
+
+  function endSignatureStroke() {
+    signatureDrawingRef.current = false;
+    const canvas = signatureCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (context) {
+      context.beginPath();
+    }
+  }
+
+  function clearDrawnSignature() {
+    const canvas = signatureCanvasRef.current;
+    if (!canvas) return;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    setSignatureDrawn(false);
+  }
+
+  async function persistDrawnSignature(labelPrefix: string): Promise<RepSignatureRow | null> {
+    if (!user) return null;
+    const canvas = signatureCanvasRef.current;
+    if (!canvas || !signatureDrawn) {
+      return null;
+    }
+    const blob = await new Promise<Blob | null>((resolve) => {
+      canvas.toBlob((value) => resolve(value), "image/png");
+    });
+    if (!blob) {
+      throw new Error("Could not export signature image.");
+    }
+
+    const filePath = `${user.id}/${Date.now()}-signature.png`;
+    const upload = await supabase.storage.from("rep-signatures").upload(filePath, blob, {
+      contentType: "image/png",
+      upsert: false,
+    });
+    if (upload.error) {
+      throw new Error(upload.error.message);
+    }
+
+    const deactive = await supabase
+      .from("rep_signatures")
+      .update({ is_active: false })
+      .eq("rep_id", user.id)
+      .eq("is_active", true);
+    if (deactive.error) {
+      throw new Error(deactive.error.message);
+    }
+
+    const { data, error: insertError } = await supabase
+      .from("rep_signatures")
+      .insert({
+        rep_id: user.id,
+        label: `${labelPrefix} ${new Date().toLocaleString()}`,
+        file_path: filePath,
+        is_active: true,
+        metadata: { source: "inspection_step_7" },
+      })
+      .select("*")
+      .single();
+    if (insertError || !data) {
+      throw new Error(insertError?.message || "Could not save signature.");
+    }
+
+    const saved = data as RepSignatureRow;
+    setRepSignatures((previous) => [saved, ...previous.map((item) => ({ ...item, is_active: false }))]);
+    setInspectionChecklist((previous) => ({ ...previous, selectedSignatureId: saved.id }));
+    return saved;
+  }
+
+  async function saveDrawnSignature() {
+    if (!signatureDrawn) {
+      setError("Draw a signature before saving.");
+      return;
+    }
+    setSavingSignature(true);
+    try {
+      const signature = await persistDrawnSignature("Signature");
+      if (signature?.id) {
+        setMessage("Signature saved.");
+      }
+    } catch (saveError) {
+      setError(parseError(saveError, "Could not save signature."));
+    } finally {
+      setSavingSignature(false);
+    }
+  }
+
+  function downloadCompletionPdf() {
+    if (!completionModal.pdfUrl || !completionModal.fileName) return;
+    const link = document.createElement("a");
+    link.href = completionModal.pdfUrl;
+    link.download = completionModal.fileName;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function closeCompletionModal() {
+    if (completionModal.pdfUrl) {
+      URL.revokeObjectURL(completionModal.pdfUrl);
+    }
+    const eventAddress = completionModal.eventAddress;
+    setCompletionModal({
+      open: false,
+      eventAddress: "",
+      title: "Inspection Report",
+      reportId: null,
+      fileName: "",
+      pdfUrl: null,
+      pdfBytes: null,
+      uploadStatus: "failed",
+      uploadError: null,
+      linkedJobId: null,
+      inspectionId: null,
+      selectedPhotoIds: [],
+      reportPayload: {},
+    });
+    if (eventAddress) {
+      resetAfterEvent(eventAddress);
+    }
+  }
+
+  async function uploadReportPdfToCrm(
+    linkedJobId: string,
+    fileName: string,
+    pdfBytes: ArrayBuffer,
+    accessTokenValue: string,
+  ) {
+    const blob = new Blob([pdfBytes], { type: "application/pdf" });
+    const init = await crmApi.initJobUpload(linkedJobId, accessTokenValue, {
+      fileName,
+      contentType: "application/pdf",
+      size: blob.size,
+    });
+    const upload = init.upload;
+    if (!upload?.filePath || !upload.token) {
+      throw new Error("CRM did not return a signed upload path for the PDF report.");
+    }
+    const uploadRes = await supabase.storage.from("job-files").uploadToSignedUrl(upload.filePath, upload.token, blob, {
+      contentType: "application/pdf",
+      upsert: false,
+    });
+    if (uploadRes.error) {
+      throw new Error(uploadRes.error.message);
+    }
+    const finalize = await crmApi.finalizeJobUpload(linkedJobId, accessTokenValue, {
+      fileName,
+      filePath: upload.filePath,
+      contentType: "application/pdf",
+    });
+    const finalizeRecord = finalize as Record<string, unknown>;
+    const crmDocumentId =
+      typeof finalizeRecord.documentId === "string"
+        ? finalizeRecord.documentId
+        : typeof finalizeRecord.id === "string"
+          ? finalizeRecord.id
+          : null;
+    const crmJobId =
+      typeof finalizeRecord.jobId === "string"
+        ? finalizeRecord.jobId
+        : typeof finalizeRecord.job_id === "string"
+          ? finalizeRecord.job_id
+          : linkedJobId;
+    return {
+      filePath: upload.filePath,
+      sizeBytes: blob.size,
+      crmDocumentId,
+      crmJobId,
+    };
+  }
+
+  async function generateInspectionPdf(params: {
+    inspectionId: string;
+    title: string;
+    selectedPhotoIds: string[];
+    payload: Record<string, unknown>;
+    accessTokenValue: string;
+  }) {
+    const pdfResponse = await fetch(`/api/inspections/${params.inspectionId}/report/pdf`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${params.accessTokenValue}`,
+      },
+      body: JSON.stringify({
+        title: params.title,
+        selectedPhotoIds: params.selectedPhotoIds,
+        payload: params.payload,
+      }),
+    });
+    if (!pdfResponse.ok) {
+      const pdfErrorPayload = (await pdfResponse.json().catch(() => ({}))) as { error?: string };
+      throw new Error(pdfErrorPayload.error || "Could not generate inspection PDF.");
+    }
+    const fileName =
+      pdfResponse.headers.get("x-report-file-name")?.trim() || `inspection-report-${params.inspectionId}.pdf`;
+    const bytes = await pdfResponse.arrayBuffer();
+    return { fileName, bytes };
+  }
+
+  async function retryCompletionReportUpload() {
+    if (!completionModal.open || !completionModal.linkedJobId || !completionModal.inspectionId || !accessToken) {
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      let pdfBytes = completionModal.pdfBytes;
+      let fileName = completionModal.fileName;
+      if (!pdfBytes || !fileName) {
+        const regenerated = await generateInspectionPdf({
+          inspectionId: completionModal.inspectionId,
+          title: completionModal.title,
+          selectedPhotoIds: completionModal.selectedPhotoIds,
+          payload: completionModal.reportPayload,
+          accessTokenValue: accessToken,
+        });
+        pdfBytes = regenerated.bytes;
+        fileName = regenerated.fileName;
+        const refreshedUrl = URL.createObjectURL(new Blob([pdfBytes], { type: "application/pdf" }));
+        setCompletionModal((previous) => {
+          if (previous.pdfUrl) URL.revokeObjectURL(previous.pdfUrl);
+          return {
+            ...previous,
+            fileName,
+            pdfBytes,
+            pdfUrl: refreshedUrl,
+          };
+        });
+      }
+
+      const uploadMeta = await uploadReportPdfToCrm(
+        completionModal.linkedJobId,
+        fileName,
+        pdfBytes,
+        accessToken,
+      );
+      if (completionModal.reportId) {
+        const { error: reportUpdateError } = await supabase
+          .from("inspection_reports")
+          .update({
+            file_name: completionModal.fileName,
+            file_path: uploadMeta.filePath,
+            content_type: "application/pdf",
+            size_bytes: uploadMeta.sizeBytes,
+            crm_document_id: uploadMeta.crmDocumentId,
+            crm_job_id: uploadMeta.crmJobId,
+            payload: {
+              ...completionModal.reportPayload,
+              upload_status: "uploaded",
+              upload_error: null,
+            },
+          })
+          .eq("id", completionModal.reportId)
+          .eq("inspection_id", completionModal.inspectionId)
+          .eq("rep_id", user?.id ?? "");
+        if (reportUpdateError) {
+          throw new Error(reportUpdateError.message || "CRM upload succeeded but report update failed.");
+        }
+      } else {
+        const retryReportResponse = await fetch(`/api/inspections/${completionModal.inspectionId}/report`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: completionModal.title,
+            linkedJobId: completionModal.linkedJobId,
+            selectedPhotoIds: completionModal.selectedPhotoIds,
+            fileName,
+            filePath: uploadMeta.filePath,
+            contentType: "application/pdf",
+            sizeBytes: uploadMeta.sizeBytes,
+            crmDocumentId: uploadMeta.crmDocumentId,
+            crmJobId: uploadMeta.crmJobId,
+            payload: {
+              ...completionModal.reportPayload,
+              upload_status: "uploaded",
+              upload_error: null,
+            },
+          }),
+        });
+        if (!retryReportResponse.ok) {
+          const retryReportPayload = (await retryReportResponse.json().catch(() => ({}))) as {
+            error?: string;
+          };
+          throw new Error(retryReportPayload.error || "CRM upload succeeded but report record save failed.");
+        }
+      }
+      setCompletionModal((previous) => ({
+        ...previous,
+        uploadStatus: "uploaded",
+        uploadError: null,
+      }));
+      setMessage("PDF uploaded to CRM successfully.");
+    } catch (retryError) {
+      setCompletionModal((previous) => ({
+        ...previous,
+        uploadStatus: "failed",
+        uploadError: parseError(retryError, "Retry failed."),
+      }));
+      setError(parseError(retryError, "Could not retry CRM PDF upload."));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function stepReady(stepKey: InspectionStepKey) {
+    if (stepKey === "perimeter_photos") {
+      return true;
+    }
+    if (stepKey === "collateral_damage") {
+      return true;
+    }
+    if (stepKey === "roof_overview") {
+      return true;
+    }
+    if (stepKey === "roof_components") {
+      return true;
+    }
+    if (stepKey === "roof_damage") {
+      return true;
+    }
+    if (stepKey === "interior_attic") {
+      return (
+        (inspectionChecklist.interiorStatus === "completed" ||
+          inspectionChecklist.interiorSkipReason.trim().length > 2) &&
+        (inspectionChecklist.atticStatus === "completed" ||
+          inspectionChecklist.atticSkipReason.trim().length > 2)
+      );
+    }
+    if (stepKey === "report_signature") {
+      return (
+        inspectionChecklist.signatureRepName.trim().length > 1 &&
+        (inspectionChecklist.selectedSignatureId !== null || signatureDrawn)
+      );
+    }
+    return true;
+  }
+
+  function goToNextInspectionStep() {
+    if (!stepReady(inspectionFlowStep.key)) {
+      setError(`Complete "${inspectionFlowStep.label}" before continuing.`);
+      return;
+    }
+    if (inspectionFlowStep.key === "roof_overview" || inspectionFlowStep.key === "roof_damage") {
+      if (photoRequirementWarnings.length > 0) {
+        setMessage(`Warning: ${photoRequirementWarnings.join(" | ")}`);
+      }
+    }
+    setError(null);
+    setInspectionStepIndex((previous) => Math.min(previous + 1, INSPECTION_FLOW.length - 1));
+  }
+
+  function goToPreviousInspectionStep() {
+    setError(null);
+    setInspectionStepIndex((previous) => Math.max(previous - 1, 0));
+  }
 
   useEffect(() => {
     currentAddressRef.current = currentAddress;
   }, [currentAddress]);
+
+  useEffect(() => {
+    void refreshSyncQueueCount();
+    const detach = setupAutoSync((syncError) => {
+      setSyncStatusMessage(`Auto-sync warning: ${parseError(syncError, "Unknown sync error.")}`);
+      void refreshSyncQueueCount();
+    });
+    void flushSyncQueue().finally(() => {
+      void refreshSyncQueueCount();
+    });
+    return detach;
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    void loadRepSignatures();
+  }, [user]);
 
   useEffect(() => {
     if (!loading && !user) {
@@ -383,6 +1222,66 @@ export default function KnockingPage() {
       active = false;
     };
   }, [supabase, user]);
+
+  useEffect(() => {
+    if (!user) return;
+    let active = true;
+
+    const loadSuggestions = async () => {
+      setLoadingSuggestions(true);
+      setSuggestionsError(null);
+      try {
+        const response = await fetch("/api/territory/suggestions", {
+          credentials: "include",
+          cache: "no-store",
+        });
+        const payload = (await response.json()) as {
+          error?: string;
+          suggestions?: Array<{
+            area_key?: string;
+            areaKey?: string;
+            center_lat?: number;
+            center_lng?: number;
+            centerLat?: number;
+            centerLng?: number;
+            zip?: string | null;
+            score?: number;
+            rank?: number;
+            reasons?: string[];
+          }>;
+        };
+        if (!response.ok) {
+          throw new Error(payload.error || `Failed to load suggestions (${response.status}).`);
+        }
+        if (!active) return;
+        const rows = Array.isArray(payload.suggestions) ? payload.suggestions : [];
+        setSuggestions(
+          rows.map((row, index) => ({
+            areaKey: String(row.areaKey ?? row.area_key ?? ""),
+            centerLat: Number(row.centerLat ?? row.center_lat ?? 0),
+            centerLng: Number(row.centerLng ?? row.center_lng ?? 0),
+            zip: row.zip ?? null,
+            score: Number(row.score ?? 0),
+            rank: Number(row.rank ?? index + 1),
+            reasons: Array.isArray(row.reasons) ? row.reasons : [],
+          })),
+        );
+      } catch (loadError) {
+        if (!active) return;
+        setSuggestions([]);
+        setSuggestionsError(parseError(loadError, "Could not load area suggestions."));
+      } finally {
+        if (active) {
+          setLoadingSuggestions(false);
+        }
+      }
+    };
+
+    void loadSuggestions();
+    return () => {
+      active = false;
+    };
+  }, [user]);
 
   useEffect(() => {
     if (!user) return;
@@ -669,7 +1568,24 @@ export default function KnockingPage() {
       setPotentialLeadDraft(DEFAULT_POTENTIAL_LEAD_DRAFT);
       setPotentialLeadMessage("Potential lead saved. It will show on Doors Map.");
     } catch (saveError) {
-      setPotentialLeadError(parseError(saveError, "Could not save potential lead."));
+      if (likelyNetworkError(saveError) || (typeof navigator !== "undefined" && !navigator.onLine)) {
+        try {
+          await queueOperation("knock_potential_leads", {
+            rep_id: user.id,
+            address,
+            address_normalized: normalizeAddress(address),
+            homeowner_name: potentialLeadDraft.homeownerName.trim() || null,
+            notes: potentialLeadDraft.notes.trim() || null,
+          });
+          setPotentialLeadDraft(DEFAULT_POTENTIAL_LEAD_DRAFT);
+          setPotentialLeadMessage("No service. Lead queued for auto-sync.");
+          setPotentialLeadError(null);
+        } catch (queueError) {
+          setPotentialLeadError(parseError(queueError, "Could not queue potential lead."));
+        }
+      } else {
+        setPotentialLeadError(parseError(saveError, "Could not save potential lead."));
+      }
     } finally {
       setSavingPotentialLead(false);
     }
@@ -794,7 +1710,26 @@ export default function KnockingPage() {
       setStep("door");
       setMessage("Knocking session started.");
     } catch (e) {
-      setError(parseError(e, "Failed to start knocking session."));
+      if (likelyNetworkError(e) || (typeof navigator !== "undefined" && !navigator.onLine)) {
+        try {
+          const nowIso = new Date().toISOString();
+          await queueOperation("knock_sessions", {
+            rep_id: user.id,
+            rep_name: fullName ?? user.email ?? "Rep",
+            status: "active",
+            started_at: nowIso,
+            latest_latitude: currentLat,
+            latest_longitude: currentLng,
+            latest_address: doorAddress || currentAddress || null,
+          });
+          setError(null);
+          setMessage("No service. Session start queued for auto-sync.");
+        } catch (queueError) {
+          setError(parseError(queueError, "Failed to queue session start."));
+        }
+      } else {
+        setError(parseError(e, "Failed to start knocking session."));
+      }
     } finally {
       setSaving(false);
     }
@@ -821,7 +1756,25 @@ export default function KnockingPage() {
       setSession(data as KnockSessionRow);
       setMessage("Session paused.");
     } catch (e) {
-      setError(parseError(e, "Failed to pause session."));
+      if (likelyNetworkError(e) || (typeof navigator !== "undefined" && !navigator.onLine)) {
+        try {
+          await queueOperation(
+            "knock_sessions",
+            { id: session.id, status: "paused", paused_at: new Date().toISOString() },
+            "update",
+            session.id,
+          );
+          setSession((previous) =>
+            previous ? { ...previous, status: "paused", paused_at: new Date().toISOString() } : previous,
+          );
+          setError(null);
+          setMessage("No service. Pause queued for auto-sync.");
+        } catch (queueError) {
+          setError(parseError(queueError, "Failed to queue pause."));
+        }
+      } else {
+        setError(parseError(e, "Failed to pause session."));
+      }
     } finally {
       setSaving(false);
     }
@@ -856,7 +1809,28 @@ export default function KnockingPage() {
       setSession(data as KnockSessionRow);
       setMessage("Session resumed.");
     } catch (e) {
-      setError(parseError(e, "Failed to resume session."));
+      if (likelyNetworkError(e) || (typeof navigator !== "undefined" && !navigator.onLine)) {
+        try {
+          await queueOperation(
+            "knock_sessions",
+            {
+              id: session.id,
+              status: "active",
+              paused_at: null,
+              total_paused_seconds: toNum(session.total_paused_seconds),
+            },
+            "update",
+            session.id,
+          );
+          setSession((previous) => (previous ? { ...previous, status: "active", paused_at: null } : previous));
+          setError(null);
+          setMessage("No service. Resume queued for auto-sync.");
+        } catch (queueError) {
+          setError(parseError(queueError, "Failed to queue resume."));
+        }
+      } else {
+        setError(parseError(e, "Failed to resume session."));
+      }
     } finally {
       setSaving(false);
     }
@@ -891,10 +1865,62 @@ export default function KnockingPage() {
       setSessionSeconds(0);
       setMessage("Session ended.");
     } catch (e) {
-      setError(parseError(e, "Failed to end session."));
+      if (likelyNetworkError(e) || (typeof navigator !== "undefined" && !navigator.onLine)) {
+        try {
+          await queueOperation(
+            "knock_sessions",
+            { id: session.id, status: "ended", ended_at: new Date().toISOString() },
+            "update",
+            session.id,
+          );
+          setSession(null);
+          setSessionEvents([]);
+          setSessionEventsError(null);
+          setEditingEventId(null);
+          setEventEditDraft(null);
+          setStep("door");
+          setSessionSeconds(0);
+          setError(null);
+          setMessage("No service. End-session queued for auto-sync.");
+        } catch (queueError) {
+          setError(parseError(queueError, "Failed to queue end session."));
+        }
+      } else {
+        setError(parseError(e, "Failed to end session."));
+      }
     } finally {
       setSaving(false);
     }
+  }
+
+  function resetAfterEvent(eventAddress: string) {
+    setHomeownerIntake({ ...DEFAULT_INTAKE, address: eventAddress || "" });
+    setInspectionChecklist(makeDefaultChecklist());
+    setInspectionPhotos([]);
+    setInspectionStepIndex(0);
+    setReportSectionSelection(DEFAULT_REPORT_SECTION_SELECTION);
+    setReportPhotoSelection({});
+    setCollateralPhotoDraft({
+      file: null,
+      damageCause: "none",
+      slopeTag: "",
+      componentTag: "",
+      customTag: "",
+      note: "",
+    });
+    setRoofDamagePhotoDraft({
+      file: null,
+      damageCause: "none",
+      slopeTag: "",
+      componentTag: "",
+      customTag: "",
+      note: "",
+    });
+    clearDrawnSignature();
+    setFollowUpAt("");
+    setStep("door");
+    setEventAction("knock");
+    setEventOutcome("no_answer");
   }
 
   async function logEvent(params: {
@@ -919,6 +1945,8 @@ export default function KnockingPage() {
     setMessage("");
 
     const postSaveWarnings: string[] = [];
+    const isInspectionEvent = params.action === "knock" && params.outcome === "inspection";
+    let completionModalState: InspectionCompletionModalState | null = null;
 
     try {
       const eventAddress = homeownerIntake.address.trim() || doorAddress.trim() || currentAddress;
@@ -928,6 +1956,90 @@ export default function KnockingPage() {
         ? params.contingentOverride ?? inspectionChecklist.contingent
         : false;
       const inspectionSnapshot = isInspection ? { ...inspectionChecklist, contingent: isContingent } : null;
+      const delta = getEventDelta({
+        action: params.action,
+        outcome: params.action === "knock" ? params.outcome ?? "no_answer" : null,
+        contingent: isContingent,
+      });
+
+      if (typeof navigator !== "undefined" && !navigator.onLine) {
+        await queueOperation("knock_events", {
+          session_id: session.id,
+          rep_id: user.id,
+          action: params.action,
+          outcome: params.action === "knock" ? params.outcome ?? null : null,
+          address: eventAddress || null,
+          latitude: currentLat,
+          longitude: currentLng,
+          knocks_delta: delta.knocks,
+          talks_delta: delta.talks,
+          inspections_delta: delta.inspections,
+          contingencies_delta: delta.contingencies,
+          homeowner_name: homeownerIntake.homeownerName.trim() || null,
+          homeowner_phone: homeownerIntake.phone.trim() || null,
+          homeowner_email: homeownerIntake.email.trim() || null,
+          metadata: isInspection
+            ? {
+                checklist: inspectionSnapshot,
+                photos: inspectionPhotos.map((photo) => ({
+                  file_name: photo.file.name,
+                  capture_section: photo.captureSection,
+                  damage_cause: photo.damageCause,
+                  slope_tag: photo.slopeTag || null,
+                  component_tag: photo.componentTag,
+                  custom_tag: photo.customTag || null,
+                  note: photo.note,
+                })),
+                queued_offline: true,
+              }
+            : { queued_offline: true },
+        });
+
+        const optimisticId = `offline-${crypto.randomUUID()}`;
+        const optimisticEvent: SessionKnockEventRow = {
+          id: optimisticId,
+          session_id: session.id,
+          rep_id: user.id,
+          action: params.action,
+          outcome: params.action === "knock" ? params.outcome ?? null : null,
+          address: eventAddress || null,
+          homeowner_name: homeownerIntake.homeownerName.trim() || null,
+          homeowner_phone: homeownerIntake.phone.trim() || null,
+          homeowner_email: homeownerIntake.email.trim() || null,
+          created_at: new Date().toISOString(),
+          is_locked: false,
+          knocks_delta: delta.knocks,
+          talks_delta: delta.talks,
+          inspections_delta: delta.inspections,
+          contingencies_delta: delta.contingencies,
+        };
+
+        setSessionEvents((previous) => [optimisticEvent, ...previous]);
+        setSession((previous) =>
+          previous
+            ? {
+                ...previous,
+                latest_address: eventAddress || null,
+                latest_latitude: currentLat,
+                latest_longitude: currentLng,
+                last_heartbeat_at: new Date().toISOString(),
+                knocks: toNum(previous.knocks) + delta.knocks,
+                talks: toNum(previous.talks) + delta.talks,
+                inspections: toNum(previous.inspections) + delta.inspections,
+                contingencies: toNum(previous.contingencies) + delta.contingencies,
+              }
+            : previous,
+        );
+
+        if (includeInNightlyNumbers) {
+          setTodayTotals((previous) => mergeNightlyDelta(previous, delta));
+        }
+
+        resetAfterEvent(eventAddress);
+        setMessage("No service. Event queued for auto-sync.");
+        return;
+      }
+
       const shouldMoveToContingency = isInspection && isContingent;
       const stageTarget: KnockStageTarget | null = shouldMoveToContingency
         ? "contingency"
@@ -937,6 +2049,9 @@ export default function KnockingPage() {
 
       let linkedJobId: string | null = null;
       let linkedTaskId: string | null = null;
+      let inspectionRecordId: string | null = null;
+      let inspectionReportId: string | null = null;
+      let signatureRecordId: string | null = inspectionChecklist.selectedSignatureId;
 
       if (isSoftSet || isInspection) {
         const jobResult = await crmApi.createJob(
@@ -992,56 +2107,346 @@ export default function KnockingPage() {
       }
 
       if (isInspection && linkedJobId) {
-        for (const file of inspectionPhotos) {
-          const init = await crmApi.initJobUpload(linkedJobId, accessToken, {
-            fileName: file.name,
-            contentType: file.type || "application/octet-stream",
-            size: file.size,
-          });
-
-          const upload = init.upload;
-          if (!upload?.filePath || !upload.token) {
-            throw new Error("Could not initialize inspection photo upload.");
+        try {
+          let freshlySavedSignature: RepSignatureRow | null = null;
+          if (!signatureRecordId && signatureDrawn) {
+            freshlySavedSignature = await persistDrawnSignature("Inspection Signature");
+            signatureRecordId = freshlySavedSignature?.id ?? null;
           }
+          const selectedSignature =
+            repSignatures.find((signature) => signature.id === signatureRecordId) ?? freshlySavedSignature ?? null;
 
-          const uploadRes = await supabase.storage
-            .from("job-files")
-            .uploadToSignedUrl(upload.filePath, upload.token, file, {
-              contentType: file.type || "application/octet-stream",
-              upsert: false,
+          const inspectionResponse = await fetch("/api/inspections", {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              sessionId: session.id,
+              linkedJobId,
+              status: "completed",
+              currentStep: inspectionFlowStep.key,
+              homeownerName: homeownerIntake.homeownerName.trim(),
+              homeownerPhone: homeownerIntake.phone.trim() || null,
+              homeownerEmail: homeownerIntake.email.trim() || null,
+              homeownerAddress: eventAddress || null,
+              signatureRepName:
+                inspectionChecklist.signatureRepName.trim() || fullName || user.email || "Rep",
+              signatureSignedAt: new Date().toISOString(),
+              completedAt: new Date().toISOString(),
+              componentPresence: inspectionChecklist.componentPresence,
+              perimeterFindings: {
+                perimeterPhotoCount: photoCountsBySection.perimeter_photos,
+                collateralDamagePhotoCount: photoCountsBySection.collateral_damage,
+              },
+              metadata: {
+                guidedFlowVersion: "v2",
+                shingleLengthInches: inspectionChecklist.shingleLengthInches || null,
+                shingleWidthInches: inspectionChecklist.shingleWidthInches || null,
+                dripEdgePresent: inspectionChecklist.dripEdgePresent,
+                contingent: isContingent,
+                notes: inspectionChecklist.notes,
+                interiorStatus: inspectionChecklist.interiorStatus,
+                interiorSkipReason: inspectionChecklist.interiorSkipReason,
+                atticStatus: inspectionChecklist.atticStatus,
+                atticSkipReason: inspectionChecklist.atticSkipReason,
+                signatureId: signatureRecordId,
+                signaturePath: selectedSignature?.file_path ?? null,
+                requiredPhotoCounts: REQUIRED_PHOTO_COUNTS,
+              },
+            }),
+          });
+          const inspectionPayload = (await inspectionResponse.json()) as {
+            error?: string;
+            inspection?: { id: string };
+          };
+          if (!inspectionResponse.ok || !inspectionPayload.inspection?.id) {
+            throw new Error(
+              inspectionPayload.error || `Could not create inspection (${inspectionResponse.status}).`,
+            );
+          }
+          inspectionRecordId = inspectionPayload.inspection.id;
+
+          const selectedPhotoIds: string[] = [];
+          const selectedDraftPhotoIds = new Set(
+            inspectionPhotos
+              .filter((photo) => reportPhotoSelection[photo.id] !== false)
+              .map((photo) => photo.id),
+          );
+
+          for (const photo of inspectionPhotos) {
+            const mediaPath = `${user.id}/${inspectionRecordId}/${Date.now()}-${sanitizeFileName(photo.file.name)}`;
+            const photoNotes = [
+              photo.note.trim() || null,
+              photo.slopeTag ? `slope:${photo.slopeTag}` : null,
+              photo.componentTag.trim() ? `component:${photo.componentTag.trim()}` : null,
+              photo.customTag.trim() ? `tag:${photo.customTag.trim()}` : null,
+            ]
+              .filter(Boolean)
+              .join(" | ");
+            const mediaUpload = await supabase.storage
+              .from("inspection-media")
+              .upload(mediaPath, photo.file, {
+                contentType: photo.file.type || "application/octet-stream",
+                upsert: false,
+              });
+            if (mediaUpload.error) {
+              throw new Error(mediaUpload.error.message);
+            }
+
+            const { data: insertedPhoto, error: insertedPhotoError } = await supabase
+              .from("inspection_photos")
+              .insert({
+                inspection_id: inspectionRecordId,
+                rep_id: user.id,
+                file_name: photo.file.name,
+                file_path: mediaPath,
+                content_type: photo.file.type || "application/octet-stream",
+                size_bytes: photo.file.size,
+                capture_section: photo.captureSection,
+                damage_cause: photo.damageCause,
+                auto_tag_source: photo.autoTagged ? "section_auto_tag" : null,
+                notes: photoNotes || null,
+              })
+              .select("id")
+              .single();
+
+            if (insertedPhotoError || !insertedPhoto) {
+              throw new Error(insertedPhotoError?.message || "Failed to save inspection photo.");
+            }
+
+            const photoId = String((insertedPhoto as { id: string }).id);
+            if (selectedDraftPhotoIds.has(photo.id)) {
+              selectedPhotoIds.push(photoId);
+            }
+
+            if (photo.damageCause !== "none") {
+              const { error: tagError } = await supabase.from("inspection_damage_tags").insert({
+                inspection_id: inspectionRecordId,
+                photo_id: photoId,
+                rep_id: user.id,
+                damage_cause: photo.damageCause,
+                slope_tag: photo.slopeTag || null,
+                custom_tag: photo.customTag || null,
+                component_tag: photo.componentTag || photo.customTag || photo.damageCause,
+                severity: "moderate",
+                note: photo.note || null,
+              });
+              if (tagError) {
+                throw new Error(tagError.message);
+              }
+            }
+
+            const init = await crmApi.initJobUpload(linkedJobId, accessToken, {
+              fileName: photo.file.name,
+              contentType: photo.file.type || "application/octet-stream",
+              size: photo.file.size,
             });
-
-          if (uploadRes.error) {
-            throw new Error(uploadRes.error.message);
+            const upload = init.upload;
+            if (upload?.filePath && upload.token) {
+              const uploadRes = await supabase.storage
+                .from("job-files")
+                .uploadToSignedUrl(upload.filePath, upload.token, photo.file, {
+                  contentType: photo.file.type || "application/octet-stream",
+                  upsert: false,
+                });
+              if (uploadRes.error) {
+                throw new Error(uploadRes.error.message);
+              }
+              await crmApi.finalizeJobUpload(linkedJobId, accessToken, {
+                fileName: photo.file.name,
+                filePath: upload.filePath,
+                contentType: photo.file.type || "application/octet-stream",
+              });
+            }
           }
 
-          await crmApi.finalizeJobUpload(linkedJobId, accessToken, {
-            fileName: file.name,
-            filePath: upload.filePath,
-            contentType: file.type || "application/octet-stream",
+          const reportPayloadData = {
+            logo: "/4ELogo.png",
+            sections: reportSectionSelection,
+            homeowner: reportSectionSelection.homeowner ? homeownerIntake : null,
+            perimeterPhotos: reportSectionSelection.perimeterPhotos
+              ? inspectionPhotos
+                  .filter((photo) => photo.captureSection === "perimeter_photos")
+                  .map((photo) => photo.file.name)
+              : null,
+            collateralDamage: reportSectionSelection.collateralDamage
+              ? inspectionPhotos
+                  .filter((photo) => photo.captureSection === "collateral_damage")
+                  .map((photo) => ({
+                    fileName: photo.file.name,
+                    damageCause: photo.damageCause,
+                    slopeTag: photo.slopeTag || null,
+                    componentTag: photo.componentTag || null,
+                    customTag: photo.customTag || null,
+                  }))
+              : null,
+            roofOverview: reportSectionSelection.roofOverview
+              ? {
+                  shingleLengthInches: inspectionChecklist.shingleLengthInches || null,
+                  shingleWidthInches: inspectionChecklist.shingleWidthInches || null,
+                  dripEdgePresent: inspectionChecklist.dripEdgePresent,
+                }
+              : null,
+            roofComponents: reportSectionSelection.roofComponents ? inspectionChecklist.componentPresence : null,
+            roofDamage: reportSectionSelection.roofDamage
+              ? inspectionPhotos
+                  .filter((photo) => photo.captureSection === "roof_damage")
+                  .map((photo) => ({
+                    fileName: photo.file.name,
+                    damageCause: photo.damageCause,
+                    slopeTag: photo.slopeTag || null,
+                    componentTag: photo.componentTag || null,
+                    customTag: photo.customTag || null,
+                  }))
+              : null,
+            interiorAttic: reportSectionSelection.interiorAttic
+              ? {
+                  interiorStatus: inspectionChecklist.interiorStatus,
+                  interiorSkipReason: inspectionChecklist.interiorSkipReason,
+                  atticStatus: inspectionChecklist.atticStatus,
+                  atticSkipReason: inspectionChecklist.atticSkipReason,
+                }
+              : null,
+            signature: reportSectionSelection.signature
+              ? {
+                  signatureRepName: inspectionChecklist.signatureRepName,
+                  signatureId: signatureRecordId,
+                  signaturePath: selectedSignature?.file_path ?? null,
+                }
+              : null,
+            notes: reportSectionSelection.summaryNotes ? inspectionChecklist.notes : null,
+            selectedDraftPhotoIds: Array.from(selectedDraftPhotoIds),
+          } as Record<string, unknown>;
+
+          let reportBytes: ArrayBuffer | null = null;
+          let reportFileName = `inspection-report-${inspectionRecordId}.pdf`;
+          let reportUploadStatus: "uploaded" | "failed" = "uploaded";
+          let reportUploadError: string | null = null;
+          let crmDocumentId: string | null = null;
+          let crmJobId: string | null = linkedJobId;
+          let reportFilePath = `${user.id}/reports/${inspectionRecordId}/${Date.now()}-${reportFileName}`;
+          let reportSizeBytes: number | null = null;
+
+          try {
+            const generatedPdf = await generateInspectionPdf({
+              inspectionId: inspectionRecordId,
+              title: "Inspection Report",
+              selectedPhotoIds,
+              payload: reportPayloadData,
+              accessTokenValue: accessToken,
+            });
+            reportFileName = generatedPdf.fileName;
+            reportBytes = generatedPdf.bytes;
+            reportSizeBytes = reportBytes.byteLength;
+          } catch (reportGenerationErrorValue) {
+            reportUploadStatus = "failed";
+            reportUploadError = parseError(
+              reportGenerationErrorValue,
+              "Could not generate inspection PDF.",
+            );
+            postSaveWarnings.push(`Inspection PDF generation failed: ${reportUploadError}`);
+          }
+
+          if (reportBytes) {
+            try {
+              const uploadMeta = await uploadReportPdfToCrm(linkedJobId, reportFileName, reportBytes, accessToken);
+              reportFilePath = uploadMeta.filePath;
+              reportSizeBytes = uploadMeta.sizeBytes;
+              crmDocumentId = uploadMeta.crmDocumentId;
+              crmJobId = uploadMeta.crmJobId;
+            } catch (reportUploadErrorValue) {
+              reportUploadStatus = "failed";
+              reportUploadError = parseError(reportUploadErrorValue, "Could not upload PDF to CRM job files.");
+              postSaveWarnings.push(`Inspection PDF upload pending retry: ${reportUploadError}`);
+            }
+          }
+
+          const reportRecordResponse = await fetch(`/api/inspections/${inspectionRecordId}/report`, {
+            method: "POST",
+            credentials: "include",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify({
+              title: "Inspection Report",
+              linkedJobId,
+              selectedPhotoIds,
+              fileName: reportFileName,
+              filePath: reportFilePath,
+              contentType: "application/pdf",
+              sizeBytes: reportSizeBytes ?? undefined,
+              crmDocumentId,
+              crmJobId,
+              payload: {
+                ...reportPayloadData,
+                upload_status: reportUploadStatus,
+                upload_error: reportUploadError,
+              },
+            }),
           });
+          const reportRecordPayload = (await reportRecordResponse.json().catch(() => ({}))) as {
+            error?: string;
+            report?: { id: string };
+          };
+          if (!reportRecordResponse.ok || !reportRecordPayload.report?.id) {
+            postSaveWarnings.push(
+              `Inspection report metadata save failed: ${
+                reportRecordPayload.error || "Could not create inspection report record."
+              }`,
+            );
+          } else {
+            inspectionReportId = reportRecordPayload.report.id;
+          }
+          const reportUrl = reportBytes
+            ? URL.createObjectURL(new Blob([reportBytes], { type: "application/pdf" }))
+            : null;
+          completionModalState = {
+            open: true,
+            eventAddress,
+            title: "Inspection Report",
+            reportId: inspectionReportId ?? null,
+            fileName: reportFileName,
+            pdfUrl: reportUrl,
+            pdfBytes: reportBytes,
+            uploadStatus: reportUploadStatus,
+            uploadError: reportUploadError,
+            linkedJobId,
+            inspectionId: inspectionRecordId,
+            selectedPhotoIds,
+            reportPayload: reportPayloadData,
+          };
+
+          const summary =
+            `Inspection Intake\n` +
+            `Homeowner: ${homeownerIntake.homeownerName}\n` +
+            `Phone: ${homeownerIntake.phone || "-"}\n` +
+            `Email: ${homeownerIntake.email || "-"}\n` +
+            `Address: ${eventAddress || "-"}\n` +
+            `Shingle Length (in): ${inspectionChecklist.shingleLengthInches || "-"}\n` +
+            `Shingle Width (in): ${inspectionChecklist.shingleWidthInches || "-"}\n` +
+            `Drip Edge Present: ${
+              inspectionChecklist.dripEdgePresent === null
+                ? "-"
+                : inspectionChecklist.dripEdgePresent
+                  ? "Yes"
+                  : "No"
+            }\n` +
+            `Contingent: ${isContingent ? "Yes" : "No"}\n` +
+            `Inspection Report ID: ${inspectionReportId || "-"}\n` +
+            `Signature ID: ${signatureRecordId || "-"}\n` +
+            `Notes: ${inspectionSnapshot?.notes || "-"}`;
+
+          await crmApi.createJobNote(linkedJobId, accessToken, summary);
+        } catch (inspectionError) {
+          postSaveWarnings.push(
+            `Inspection workflow assets warning: ${parseError(
+              inspectionError,
+              "Inspection workflow assets failed.",
+            )}`,
+          );
         }
-
-        const summary =
-          `Inspection Intake\n` +
-          `Homeowner: ${homeownerIntake.homeownerName}\n` +
-          `Phone: ${homeownerIntake.phone || "-"}\n` +
-          `Email: ${homeownerIntake.email || "-"}\n` +
-          `Address: ${eventAddress || "-"}\n` +
-          `Roof Age: ${inspectionSnapshot?.roofAge || "-"}\n` +
-          `Visible Damage: ${inspectionSnapshot?.visibleDamage || "-"}\n` +
-          `Carrier: ${inspectionSnapshot?.insuranceCarrier || "-"}\n` +
-          `Contingent: ${isContingent ? "Yes" : "No"}\n` +
-          `Notes: ${inspectionSnapshot?.notes || "-"}`;
-
-        await crmApi.createJobNote(linkedJobId, accessToken, summary);
       }
-
-      const delta = getEventDelta({
-        action: params.action,
-        outcome: params.action === "knock" ? params.outcome ?? "no_answer" : null,
-        contingent: isContingent,
-      });
 
       const eventPayload: JsonRecord = {
         session_id: session.id,
@@ -1062,16 +2467,19 @@ export default function KnockingPage() {
         linked_task_id: linkedTaskId,
         is_locked: Boolean(linkedJobId || linkedTaskId),
         metadata: isInspection
-          ? {
-              checklist: inspectionSnapshot,
-              photo_count: inspectionPhotos.length,
-            }
+            ? {
+                checklist: inspectionSnapshot,
+                photo_count: inspectionPhotos.length,
+                inspection_id: inspectionRecordId,
+                inspection_report_id: inspectionReportId,
+                signature_id: signatureRecordId,
+              }
           : {},
       };
 
       const [{ data: insertedEvent, error: insertError }, { data: updatedSession, error: sessionError }] =
         await Promise.all([
-          supabase.from("knock_events").insert(eventPayload).select(KNOCK_EVENT_SELECT).single(),
+        supabase.from("knock_events").insert(eventPayload).select(KNOCK_EVENT_SELECT).single(),
         supabase
           .from("knock_sessions")
           .update({
@@ -1110,18 +2518,18 @@ export default function KnockingPage() {
         }
       }
 
-      setHomeownerIntake({ ...DEFAULT_INTAKE, address: eventAddress || "" });
-      setInspectionChecklist(DEFAULT_CHECKLIST);
-      setInspectionPhotos([]);
-      setFollowUpAt("");
-      setStep("door");
-      setEventAction("knock");
-      setEventOutcome("no_answer");
+      if (completionModalState) {
+        setCompletionModal(completionModalState);
+      } else {
+        resetAfterEvent(eventAddress);
+      }
 
       const baseMessage =
-        includeInNightlyNumbers
-          ? "Event logged and nightly numbers synced."
-          : "Event logged. Nightly sync skipped (not on nightly roster).";
+        completionModalState
+          ? "Inspection completed. PDF report is ready below."
+          : includeInNightlyNumbers
+            ? "Event logged and nightly numbers synced."
+            : "Event logged. Nightly sync skipped (not on nightly roster).";
 
       setMessage(
         postSaveWarnings.length > 0
@@ -1129,7 +2537,32 @@ export default function KnockingPage() {
           : baseMessage,
       );
     } catch (e) {
-      setError(parseError(e, "Failed to log door event."));
+      if (likelyNetworkError(e)) {
+        try {
+          await queueOperation("knock_events", {
+            session_id: session.id,
+            rep_id: user.id,
+            action: params.action,
+            outcome: params.action === "knock" ? params.outcome ?? null : null,
+            address: homeownerIntake.address.trim() || doorAddress.trim() || currentAddress || null,
+            homeowner_name: homeownerIntake.homeownerName.trim() || null,
+            homeowner_phone: homeownerIntake.phone.trim() || null,
+            homeowner_email: homeownerIntake.email.trim() || null,
+            metadata: isInspectionEvent
+              ? {
+                  checklist: inspectionChecklist,
+                  photo_count: inspectionPhotos.length,
+                }
+              : {},
+          });
+          setError(null);
+          setMessage("Network issue. Event queued for auto-sync.");
+        } catch (queueError) {
+          setError(parseError(queueError, "Failed to log or queue door event."));
+        }
+      } else {
+        setError(parseError(e, "Failed to log door event."));
+      }
     } finally {
       setSaving(false);
     }
@@ -1170,6 +2603,13 @@ export default function KnockingPage() {
       return;
     }
 
+    setInspectionStepIndex(0);
+    setInspectionChecklist((previous) => ({
+      ...previous,
+      signatureRepName: previous.signatureRepName || fullName || user?.email || "",
+      selectedSignatureId:
+        previous.selectedSignatureId || repSignatures.find((signature) => signature.is_active)?.id || null,
+    }));
     setStep("inspection");
   }
 
@@ -1183,7 +2623,13 @@ export default function KnockingPage() {
 
   if (!session) {
     return (
-      <AppShell role={role} onSignOut={signOut} debug={{ userId: user.id, role, accessToken, authError }}>
+      <AppShell
+        role={role}
+        profileName={fullName}
+        profileImageUrl={profileImageUrl}
+        onSignOut={signOut}
+        debug={{ userId: user.id, role, accessToken, authError }}
+      >
         <section className="panel">
           <h2 style={{ margin: 0 }}>Knocking</h2>
           <p className="hint">Start a session to enter full-screen mobile knocking mode.</p>
@@ -1191,6 +2637,7 @@ export default function KnockingPage() {
             Today: K {todayTotals.knocks} | T {todayTotals.talks} | I {todayTotals.inspections} | C {" "}
             {todayTotals.contingencies}
           </p>
+          <p className="hint">Offline queue: {syncQueueCount} pending operation(s).</p>
           {!includeInNightlyNumbers ? (
             <p className="error">You are not included on nightly numbers; events still log.</p>
           ) : null}
@@ -1198,10 +2645,14 @@ export default function KnockingPage() {
             <button onClick={startSession} disabled={saving}>
               {saving ? "Starting..." : "Start Session"}
             </button>
+            <button className="secondary" onClick={() => void syncNow()} disabled={syncingNow}>
+              {syncingNow ? "Syncing..." : "Sync Now"}
+            </button>
             <button className="secondary" onClick={() => router.push("/jobs")}>
               Back Home
             </button>
           </div>
+          {syncStatusMessage ? <p className="hint">{syncStatusMessage}</p> : null}
           {error ? <p className="error">{error}</p> : null}
           {message ? <p className="hint">{message}</p> : null}
         </section>
@@ -1309,6 +2760,46 @@ export default function KnockingPage() {
           Today: K {todayTotals.knocks} | T {todayTotals.talks} | I {todayTotals.inspections} | C {" "}
           {todayTotals.contingencies}
         </p>
+        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+          <button className="secondary" onClick={() => void syncNow()} disabled={syncingNow}>
+            {syncingNow ? "Syncing..." : "Sync Now"}
+          </button>
+          <span className="hint">Offline queue: {syncQueueCount} pending</span>
+          {syncStatusMessage ? <span className="hint">{syncStatusMessage}</span> : null}
+        </div>
+        <p className="hint">
+          Session feedback: {sessionFeedback.knocksPerHour.toFixed(1)} knocks/hr | Talk{" "}
+          {(sessionFeedback.talkRate * 100).toFixed(1)}% | Inspection{" "}
+          {(sessionFeedback.inspectionRate * 100).toFixed(1)}% | Contingency{" "}
+          {(sessionFeedback.contingencyRate * 100).toFixed(1)}%
+        </p>
+        <div className="job-card" style={{ marginTop: 10 }}>
+          <div className="row">
+            <strong>Suggested Areas To Knock</strong>
+            <Link href="/knocking/doors" className="hint">
+              Open Doors Map
+            </Link>
+          </div>
+          {loadingSuggestions ? <p className="hint">Loading suggestions...</p> : null}
+          {suggestionsError ? <p className="error">{suggestionsError}</p> : null}
+          {!loadingSuggestions && suggestions.length === 0 ? (
+            <p className="hint">No suggestion snapshot yet. Start knocking and refresh.</p>
+          ) : null}
+          <div className="grid" style={{ marginTop: 8 }}>
+            {suggestions.slice(0, 3).map((suggestion) => (
+              <article key={suggestion.areaKey} className="job-card">
+                <div className="row">
+                  <strong>Rank #{suggestion.rank}</strong>
+                  <span className="hint">Score {(suggestion.score * 100).toFixed(1)}</span>
+                </div>
+                <p className="hint">
+                  {suggestion.areaKey} {suggestion.zip ? `| ZIP ${suggestion.zip}` : ""}
+                </p>
+                <p className="hint">{suggestion.reasons.join(" | ")}</p>
+              </article>
+            ))}
+          </div>
+        </div>
 
         {locationError ? <p className="error">{locationError}</p> : null}
         {message ? <p className="hint">{message}</p> : null}
@@ -1456,80 +2947,712 @@ export default function KnockingPage() {
             className="knock-step stack"
             onSubmit={(e) => {
               e.preventDefault();
-              const contingentInput = e.currentTarget.elements.namedItem("contingent");
-              const contingentChecked =
-                contingentInput instanceof HTMLInputElement ? contingentInput.checked : undefined;
+              if (inspectionFlowStep.key !== "report_signature") {
+                goToNextInspectionStep();
+                return;
+              }
+              if (!stepReady("report_signature")) {
+                setError("Rep signature name and a saved or drawn signature are required before submit.");
+                return;
+              }
+              if (photoRequirementWarnings.length > 0) {
+                setMessage(`Warning: ${photoRequirementWarnings.join(" | ")}. Submitting anyway.`);
+              }
               void logEvent({
                 action: "knock",
                 outcome: "inspection",
                 homeownerRequired: true,
-                contingentOverride: contingentChecked,
+                contingentOverride: inspectionChecklist.contingent,
               });
             }}
           >
-            <h2>Inspection Intake</h2>
-            <label className="stack">
-              Roof age / material notes
-              <input
-                value={inspectionChecklist.roofAge}
-                onChange={(e) => setInspectionChecklist((prev) => ({ ...prev, roofAge: e.target.value }))}
-              />
-            </label>
-            <label className="stack">
-              Visible damage
-              <textarea
-                rows={3}
-                value={inspectionChecklist.visibleDamage}
-                onChange={(e) =>
-                  setInspectionChecklist((prev) => ({ ...prev, visibleDamage: e.target.value }))
-                }
-              />
-            </label>
-            <label className="stack">
-              Insurance carrier
-              <input
-                value={inspectionChecklist.insuranceCarrier}
-                onChange={(e) =>
-                  setInspectionChecklist((prev) => ({ ...prev, insuranceCarrier: e.target.value }))
-                }
-              />
-            </label>
-            <label className="row">
-              <span>Contingency signed</span>
-              <input
-                type="checkbox"
-                name="contingent"
-                style={{ width: "auto" }}
-                checked={inspectionChecklist.contingent}
-                onChange={(e) =>
-                  setInspectionChecklist((prev) => ({ ...prev, contingent: e.target.checked }))
-                }
-              />
-            </label>
-            <label className="stack">
-              Extra notes
-              <textarea
-                rows={3}
-                value={inspectionChecklist.notes}
-                onChange={(e) => setInspectionChecklist((prev) => ({ ...prev, notes: e.target.value }))}
-              />
-            </label>
-            <label className="stack">
-              Photos
-              <input
-                type="file"
-                multiple
-                accept="image/*"
-                onChange={(e) => setInspectionPhotos(Array.from(e.target.files ?? []))}
-              />
-            </label>
-            <button type="submit" disabled={saving}>
-              {saving ? "Saving..." : "Save Inspection"}
-            </button>
-            <button type="button" className="secondary" onClick={() => setStep("homeowner")}>Back</button>
+            <h2>
+              Guided Inspection: {inspectionFlowStep.label} ({inspectionStepIndex + 1}/{INSPECTION_FLOW.length})
+            </h2>
+            <p className="hint">{inspectionFlowStep.description}</p>
+            <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+              {INSPECTION_FLOW.map((flowStep, index) => (
+                <span
+                  key={flowStep.key}
+                  className="hint"
+                  style={{
+                    border: "1px solid var(--border)",
+                    borderRadius: 999,
+                    padding: "2px 10px",
+                    background:
+                      index === inspectionStepIndex ? "var(--panel-soft-hover)" : "transparent",
+                  }}
+                >
+                  {index + 1}. {flowStep.label}
+                </span>
+              ))}
+            </div>
+
+            {inspectionFlowStep.key === "perimeter_photos" ? (
+              <div className="stack">
+                <label className="stack">
+                  Add perimeter photos
+                  <input
+                    type="file"
+                    multiple
+                    accept="image/jpeg,image/png"
+                    onChange={(event) => {
+                      pushInspectionPhotos(event.target.files, {
+                        captureSection: "perimeter_photos",
+                        damageCause: "none",
+                      });
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                <p className="hint">
+                  Perimeter photos: {photoCountsBySection.perimeter_photos}/{REQUIRED_PHOTO_COUNTS.perimeterPhotos}
+                </p>
+                {missingRequiredPhotos.perimeterPhotos > 0 ? (
+                  <p className="hint">
+                    Warning only: you are short {missingRequiredPhotos.perimeterPhotos} perimeter photo(s).
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
+            {inspectionFlowStep.key === "collateral_damage" ? (
+              <div className="stack">
+                <label className="stack">
+                  Collateral damage photo
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png"
+                    onChange={(event) => {
+                      setCollateralPhotoDraft((previous) => ({
+                        ...previous,
+                        file: event.target.files?.[0] ?? null,
+                      }));
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                {collateralPhotoDraft.file ? (
+                  <p className="hint">Selected: {collateralPhotoDraft.file.name}</p>
+                ) : (
+                  <p className="hint">Select or capture one photo, then save.</p>
+                )}
+                <label className="stack">
+                  Damage type (optional)
+                  <select
+                    value={collateralPhotoDraft.damageCause}
+                    onChange={(event) =>
+                      setCollateralPhotoDraft((previous) => ({
+                        ...previous,
+                        damageCause: event.target.value as DamageCause,
+                      }))
+                    }
+                  >
+                    <option value="none">None</option>
+                    <option value="hail">Hail</option>
+                    <option value="wind">Wind</option>
+                    <option value="other">Other</option>
+                  </select>
+                </label>
+                <label className="stack">
+                  Slope (optional)
+                  <select
+                    value={collateralPhotoDraft.slopeTag}
+                    onChange={(event) =>
+                      setCollateralPhotoDraft((previous) => ({
+                        ...previous,
+                        slopeTag: event.target.value as DamageSlope | "",
+                      }))
+                    }
+                  >
+                    <option value="">Not set</option>
+                    <option value="front">Front</option>
+                    <option value="rear">Rear</option>
+                    <option value="left">Left</option>
+                    <option value="right">Right</option>
+                    <option value="other">Other</option>
+                  </select>
+                </label>
+                <label className="stack">
+                  Component tag (optional)
+                  <input
+                    value={collateralPhotoDraft.componentTag}
+                    onChange={(event) =>
+                      setCollateralPhotoDraft((previous) => ({ ...previous, componentTag: event.target.value }))
+                    }
+                  />
+                </label>
+                <label className="stack">
+                  Free-text tag (optional)
+                  <input
+                    value={collateralPhotoDraft.customTag}
+                    onChange={(event) =>
+                      setCollateralPhotoDraft((previous) => ({ ...previous, customTag: event.target.value }))
+                    }
+                  />
+                </label>
+                <label className="stack">
+                  Note (optional)
+                  <input
+                    value={collateralPhotoDraft.note}
+                    onChange={(event) =>
+                      setCollateralPhotoDraft((previous) => ({ ...previous, note: event.target.value }))
+                    }
+                  />
+                </label>
+                <div className="row">
+                  <button
+                    type="button"
+                    disabled={!collateralPhotoDraft.file}
+                    onClick={() => {
+                      const saved = addQuickTaggedPhoto(collateralPhotoDraft, "collateral_damage");
+                      if (!saved) return;
+                      setCollateralPhotoDraft((previous) => ({
+                        ...previous,
+                        file: null,
+                        note: "",
+                        customTag: "",
+                        componentTag: "",
+                      }));
+                    }}
+                  >
+                    Save Collateral Photo
+                  </button>
+                </div>
+                <p className="hint">Collateral photos captured: {photoCountsBySection.collateral_damage}</p>
+              </div>
+            ) : null}
+
+            {inspectionFlowStep.key === "roof_overview" ? (
+              <div className="stack">
+                <label className="stack">
+                  Overview photos
+                  <input
+                    type="file"
+                    multiple
+                    accept="image/jpeg,image/png"
+                    onChange={(event) => {
+                      pushInspectionPhotos(event.target.files, {
+                        captureSection: "roof_overview",
+                        damageCause: "none",
+                      });
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                <label className="stack">
+                  Layer photo (auto-tagged)
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png"
+                    onChange={(event) => {
+                      pushInspectionPhotos(event.target.files, {
+                        captureSection: "roof_overview",
+                        damageCause: "none",
+                        componentTag: "layer_photo",
+                        customTag: "layer_photo",
+                        autoTagged: true,
+                      });
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                <div className="grid">
+                  <label className="stack">
+                    Shingle length (inches, optional)
+                    <input
+                      inputMode="decimal"
+                      value={inspectionChecklist.shingleLengthInches}
+                      onChange={(event) =>
+                        setInspectionChecklist((previous) => ({
+                          ...previous,
+                          shingleLengthInches: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  <label className="stack">
+                    Shingle width (inches, optional)
+                    <input
+                      inputMode="decimal"
+                      value={inspectionChecklist.shingleWidthInches}
+                      onChange={(event) =>
+                        setInspectionChecklist((previous) => ({
+                          ...previous,
+                          shingleWidthInches: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+                <label className="stack">
+                  Drip edge present?
+                  <select
+                    value={
+                      inspectionChecklist.dripEdgePresent === null
+                        ? ""
+                        : inspectionChecklist.dripEdgePresent
+                          ? "yes"
+                          : "no"
+                    }
+                    onChange={(event) =>
+                      setInspectionChecklist((previous) => ({
+                        ...previous,
+                        dripEdgePresent:
+                          event.target.value === ""
+                            ? null
+                            : event.target.value === "yes"
+                              ? true
+                              : false,
+                      }))
+                    }
+                  >
+                    <option value="">Not set</option>
+                    <option value="yes">Yes</option>
+                    <option value="no">No</option>
+                  </select>
+                </label>
+                <p className="hint">
+                  Roof overview photos: {photoCountsBySection.roof_overview}/{REQUIRED_PHOTO_COUNTS.roofOverview}
+                </p>
+                {missingRequiredPhotos.roofOverview > 0 ? (
+                  <p className="hint">
+                    Warning only: you are short {missingRequiredPhotos.roofOverview} roof overview photo(s).
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
+            {inspectionFlowStep.key === "roof_components" ? (
+              <div className="stack">
+                {COMPONENT_PRESENCE_KEYS.map((componentKey) => {
+                  const entry = inspectionChecklist.componentPresence[componentKey] ?? {
+                    present: false,
+                    quantity: null,
+                  };
+                  return (
+                    <div key={componentKey} className="job-card">
+                      <div className="row">
+                        <strong>{componentKey.replaceAll("_", " ")}</strong>
+                        <label className="row">
+                          <span>Present</span>
+                          <input
+                            type="checkbox"
+                            style={{ width: "auto" }}
+                            checked={entry.present}
+                            onChange={(event) => updateInspectionComponent(componentKey, event.target.checked)}
+                          />
+                        </label>
+                      </div>
+                      {entry.present ? (
+                        <label className="stack">
+                          Quantity
+                          <input
+                            inputMode="numeric"
+                            min={0}
+                            value={entry.quantity ?? ""}
+                            onChange={(event) =>
+                              updateInspectionComponentQuantity(componentKey, event.target.value)
+                            }
+                          />
+                        </label>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+
+            {inspectionFlowStep.key === "roof_damage" ? (
+              <div className="stack">
+                <label className="stack">
+                  Roof damage photo
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png"
+                    onChange={(event) => {
+                      setRoofDamagePhotoDraft((previous) => ({
+                        ...previous,
+                        file: event.target.files?.[0] ?? null,
+                      }));
+                      event.currentTarget.value = "";
+                    }}
+                  />
+                </label>
+                {roofDamagePhotoDraft.file ? (
+                  <p className="hint">Selected: {roofDamagePhotoDraft.file.name}</p>
+                ) : (
+                  <p className="hint">Select or capture one photo, then save.</p>
+                )}
+                <label className="stack">
+                  Damage type (optional)
+                  <select
+                    value={roofDamagePhotoDraft.damageCause}
+                    onChange={(event) =>
+                      setRoofDamagePhotoDraft((previous) => ({
+                        ...previous,
+                        damageCause: event.target.value as DamageCause,
+                      }))
+                    }
+                  >
+                    <option value="none">None</option>
+                    <option value="hail">Hail</option>
+                    <option value="wind">Wind</option>
+                    <option value="other">Other</option>
+                  </select>
+                </label>
+                <label className="stack">
+                  Slope (optional)
+                  <select
+                    value={roofDamagePhotoDraft.slopeTag}
+                    onChange={(event) =>
+                      setRoofDamagePhotoDraft((previous) => ({
+                        ...previous,
+                        slopeTag: event.target.value as DamageSlope | "",
+                      }))
+                    }
+                  >
+                    <option value="">Not set</option>
+                    <option value="front">Front</option>
+                    <option value="rear">Rear</option>
+                    <option value="left">Left</option>
+                    <option value="right">Right</option>
+                    <option value="other">Other</option>
+                  </select>
+                </label>
+                <label className="stack">
+                  Component tag (optional)
+                  <input
+                    value={roofDamagePhotoDraft.componentTag}
+                    onChange={(event) =>
+                      setRoofDamagePhotoDraft((previous) => ({ ...previous, componentTag: event.target.value }))
+                    }
+                  />
+                </label>
+                <label className="stack">
+                  Free-text tag (optional)
+                  <input
+                    value={roofDamagePhotoDraft.customTag}
+                    onChange={(event) =>
+                      setRoofDamagePhotoDraft((previous) => ({ ...previous, customTag: event.target.value }))
+                    }
+                  />
+                </label>
+                <label className="stack">
+                  Note (optional)
+                  <input
+                    value={roofDamagePhotoDraft.note}
+                    onChange={(event) =>
+                      setRoofDamagePhotoDraft((previous) => ({ ...previous, note: event.target.value }))
+                    }
+                  />
+                </label>
+                <div className="row">
+                  <button
+                    type="button"
+                    disabled={!roofDamagePhotoDraft.file}
+                    onClick={() => {
+                      const saved = addQuickTaggedPhoto(roofDamagePhotoDraft, "roof_damage");
+                      if (!saved) return;
+                      setRoofDamagePhotoDraft((previous) => ({
+                        ...previous,
+                        file: null,
+                        note: "",
+                        customTag: "",
+                        componentTag: "",
+                      }));
+                    }}
+                  >
+                    Save Roof Damage Photo
+                  </button>
+                </div>
+                <p className="hint">
+                  Roof damage photos: {photoCountsBySection.roof_damage}/{REQUIRED_PHOTO_COUNTS.roofDamage}
+                </p>
+                {missingRequiredPhotos.roofDamage > 0 ? (
+                  <p className="hint">
+                    Warning only: you are short {missingRequiredPhotos.roofDamage} roof damage photo(s).
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+
+            {inspectionFlowStep.key === "interior_attic" ? (
+              <>
+                <label className="row">
+                  <span>Interior inspected</span>
+                  <input
+                    type="checkbox"
+                    style={{ width: "auto" }}
+                    checked={inspectionChecklist.interiorStatus === "completed"}
+                    onChange={(event) =>
+                      setInspectionChecklist((previous) => ({
+                        ...previous,
+                        interiorStatus: event.target.checked ? "completed" : "skipped",
+                      }))
+                    }
+                  />
+                </label>
+                {inspectionChecklist.interiorStatus === "skipped" ? (
+                  <label className="stack">
+                    Interior skip reason (required)
+                    <input
+                      value={inspectionChecklist.interiorSkipReason}
+                      onChange={(event) =>
+                        setInspectionChecklist((previous) => ({
+                          ...previous,
+                          interiorSkipReason: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                ) : (
+                  <p className="hint">Interior marked complete.</p>
+                )}
+
+                <label className="row">
+                  <span>Attic inspected</span>
+                  <input
+                    type="checkbox"
+                    style={{ width: "auto" }}
+                    checked={inspectionChecklist.atticStatus === "completed"}
+                    onChange={(event) =>
+                      setInspectionChecklist((previous) => ({
+                        ...previous,
+                        atticStatus: event.target.checked ? "completed" : "skipped",
+                      }))
+                    }
+                  />
+                </label>
+                {inspectionChecklist.atticStatus === "skipped" ? (
+                  <label className="stack">
+                    Attic skip reason (required)
+                    <input
+                      value={inspectionChecklist.atticSkipReason}
+                      onChange={(event) =>
+                        setInspectionChecklist((previous) => ({
+                          ...previous,
+                          atticSkipReason: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                ) : (
+                  <p className="hint">Attic marked complete.</p>
+                )}
+              </>
+            ) : null}
+
+            {inspectionFlowStep.key === "report_signature" ? (
+              <>
+                <label className="stack">
+                  Rep signature name *
+                  <input
+                    value={inspectionChecklist.signatureRepName}
+                    onChange={(event) =>
+                      setInspectionChecklist((previous) => ({
+                        ...previous,
+                        signatureRepName: event.target.value,
+                      }))
+                    }
+                    required
+                  />
+                </label>
+                <label className="row">
+                  <span>Contingency signed</span>
+                  <input
+                    type="checkbox"
+                    style={{ width: "auto" }}
+                    checked={inspectionChecklist.contingent}
+                    onChange={(event) =>
+                      setInspectionChecklist((previous) => ({
+                        ...previous,
+                        contingent: event.target.checked,
+                      }))
+                    }
+                  />
+                </label>
+                <label className="stack">
+                  Final notes
+                  <textarea
+                    rows={3}
+                    value={inspectionChecklist.notes}
+                    onChange={(event) =>
+                      setInspectionChecklist((previous) => ({ ...previous, notes: event.target.value }))
+                    }
+                  />
+                </label>
+
+                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Saved Signatures</h3>
+                {loadingSignatures ? <p className="hint">Loading signatures...</p> : null}
+                {repSignatures.length > 0 ? (
+                  <div className="grid">
+                    {repSignatures.map((signature) => (
+                      <label key={signature.id} className="row">
+                        <span>{signature.label || "Saved signature"}</span>
+                        <input
+                          type="radio"
+                          name="rep-signature"
+                          style={{ width: "auto" }}
+                          checked={inspectionChecklist.selectedSignatureId === signature.id}
+                          onChange={() =>
+                            setInspectionChecklist((previous) => ({
+                              ...previous,
+                              selectedSignatureId: signature.id,
+                            }))
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="hint">No saved signatures yet.</p>
+                )}
+
+                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Draw Signature</h3>
+                <canvas
+                  ref={signatureCanvasRef}
+                  width={420}
+                  height={160}
+                  style={{
+                    width: "100%",
+                    maxWidth: 420,
+                    border: "1px solid var(--border)",
+                    borderRadius: 8,
+                    background: "#fff",
+                    touchAction: "none",
+                  }}
+                  onPointerDown={startSignatureStroke}
+                  onPointerMove={moveSignatureStroke}
+                  onPointerUp={endSignatureStroke}
+                  onPointerLeave={endSignatureStroke}
+                />
+                <div className="row">
+                  <button type="button" className="secondary" onClick={clearDrawnSignature}>
+                    Clear Drawing
+                  </button>
+                  <button type="button" className="secondary" onClick={() => void saveDrawnSignature()} disabled={savingSignature}>
+                    {savingSignature ? "Saving..." : "Save As Reusable Signature"}
+                  </button>
+                </div>
+
+                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Inspection Report Includes</h3>
+                <div className="grid">
+                  {(Object.keys(DEFAULT_REPORT_SECTION_SELECTION) as Array<keyof ReportSectionSelection>).map(
+                    (sectionKey) => (
+                      <label key={sectionKey} className="row">
+                        <span>{sectionKey.replace(/([A-Z])/g, " $1").toLowerCase()}</span>
+                        <input
+                          type="checkbox"
+                          style={{ width: "auto" }}
+                          checked={reportSectionSelection[sectionKey]}
+                          onChange={(event) =>
+                            setReportSectionSelection((previous) => ({
+                              ...previous,
+                              [sectionKey]: event.target.checked,
+                            }))
+                          }
+                        />
+                      </label>
+                    ),
+                  )}
+                </div>
+                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Photos Included In Report</h3>
+                <div className="grid">
+                  {inspectionPhotos.map((photo) => (
+                    <label key={photo.id} className="row">
+                      <span>{photo.file.name}</span>
+                      <input
+                        type="checkbox"
+                        style={{ width: "auto" }}
+                        checked={reportPhotoSelection[photo.id] !== false}
+                        onChange={(event) =>
+                          setReportPhotoSelection((previous) => ({
+                            ...previous,
+                            [photo.id]: event.target.checked,
+                          }))
+                        }
+                      />
+                    </label>
+                  ))}
+                  {inspectionPhotos.length === 0 ? (
+                    <p className="hint">No photos captured yet.</p>
+                  ) : null}
+                </div>
+                {photoRequirementWarnings.length > 0 ? (
+                  <p className="hint">
+                    Warning only: {photoRequirementWarnings.join(" | ")}.
+                  </p>
+                ) : null}
+              </>
+            ) : null}
+
+            <div className="row" style={{ marginTop: 8 }}>
+              <button type="button" className="secondary" onClick={() => setStep("homeowner")}>
+                Back To Homeowner
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={goToPreviousInspectionStep}
+                disabled={inspectionStepIndex === 0}
+              >
+                Previous Step
+              </button>
+              {inspectionFlowStep.key === "report_signature" ? (
+                <button type="submit" disabled={saving}>
+                  {saving ? "Saving..." : "Complete Inspection"}
+                </button>
+              ) : (
+                <button type="submit" disabled={saving}>
+                  Next Step
+                </button>
+              )}
+            </div>
           </form>
         ) : null}
       </section>
+
+      {completionModal.open ? (
+        <section className="knock-card" style={{ borderColor: "var(--accent)" }}>
+          <div className="row">
+            <h2 style={{ margin: 0 }}>Inspection Complete</h2>
+            <span className="hint">
+              CRM Upload: {completionModal.uploadStatus === "uploaded" ? "Uploaded" : "Needs Retry"}
+            </span>
+          </div>
+          {completionModal.uploadError ? <p className="error">{completionModal.uploadError}</p> : null}
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            <button type="button" onClick={downloadCompletionPdf}>
+              Download PDF
+            </button>
+            {completionModal.uploadStatus !== "uploaded" ? (
+              <button type="button" className="secondary" onClick={() => void retryCompletionReportUpload()} disabled={saving}>
+                {saving ? "Retrying..." : "Retry CRM Upload"}
+              </button>
+            ) : null}
+            <button type="button" className="secondary" onClick={closeCompletionModal}>
+              Done
+            </button>
+          </div>
+          {completionModal.pdfUrl ? (
+            <iframe
+              title="Inspection report PDF preview"
+              src={completionModal.pdfUrl}
+              style={{
+                width: "100%",
+                minHeight: 440,
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                marginTop: 10,
+                background: "#fff",
+              }}
+            />
+          ) : (
+            <p className="hint">Preview unavailable. Use download instead.</p>
+          )}
+        </section>
+      ) : null}
 
       <section className="knock-card">
         <div className="row">

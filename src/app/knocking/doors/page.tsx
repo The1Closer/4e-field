@@ -7,6 +7,7 @@ import { loadGoogleMaps } from "@/lib/google-maps";
 import { managerLike } from "@/lib/knocking";
 import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 import { useAuthSession } from "@/lib/use-auth-session";
+import type { HeatmapCell, HeatmapLayer } from "@/types/field-intelligence";
 import type { JsonRecord } from "@/types/models";
 
 type KnockEventRow = JsonRecord & {
@@ -119,9 +120,17 @@ type RouteSummary = {
 
 type StatusFilterKey = LeadStatus | "no_lead";
 type RouteStartMode = "pin" | "user_location";
+type MapMode = "pins" | "heatmap";
 
 const CONTINGENCY_STAGE_ID = 2;
 const LEAD_DOC_BUCKET = "knock-potential-lead-documents";
+const HEATMAP_LAYERS: Array<{ value: HeatmapLayer; label: string }> = [
+  { value: "conversions", label: "Conversions" },
+  { value: "approval_rate", label: "Approval Rate" },
+  { value: "knock_density", label: "Knock Density" },
+  { value: "inspection_rate", label: "Inspection Rate" },
+  { value: "contingency_close", label: "Contingency Rate" },
+];
 
 const POTENTIAL_LEAD_SELECT =
   "id,rep_id,address,address_normalized,latitude,longitude,created_at,updated_at,homeowner_name,homeowner_phone,homeowner_email,lead_source,lead_status,best_contact_time,follow_up_at,notes,additional_details";
@@ -502,8 +511,16 @@ async function geocodeAddress(address: string, apiKey: string) {
 
 export default function KnockingDoorsPage() {
   const router = useRouter();
-  const { user, loading, role, signOut, accessToken, error: authError } =
-    useAuthSession();
+  const {
+    user,
+    loading,
+    role,
+    signOut,
+    accessToken,
+    error: authError,
+    profileImageUrl,
+    fullName,
+  } = useAuthSession();
   const supabase = getSupabaseBrowserClient();
 
   const [pins, setPins] = useState<DoorPin[]>([]);
@@ -548,7 +565,16 @@ export default function KnockingDoorsPage() {
 
   const [mapError, setMapError] = useState<string | null>(null);
   const [mapReady, setMapReady] = useState(false);
+  const [mapMode, setMapMode] = useState<MapMode>("pins");
+  const [heatmapLayer, setHeatmapLayer] = useState<HeatmapLayer>("conversions");
+  const [heatmapDays, setHeatmapDays] = useState<number>(30);
+  const [heatmapCells, setHeatmapCells] = useState<HeatmapCell[]>([]);
+  const [loadingHeatmap, setLoadingHeatmap] = useState(false);
+  const [heatmapError, setHeatmapError] = useState<string | null>(null);
   const [isDrawingRouteCircle, setIsDrawingRouteCircle] = useState(false);
+  const [hasRouteCircle, setHasRouteCircle] = useState(false);
+  const [routeCircleRadiusMilesInput, setRouteCircleRadiusMilesInput] =
+    useState("");
   const [selectedRoutePinKeys, setSelectedRoutePinKeys] = useState<string[]>([]);
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [routeLaunchUrl, setRouteLaunchUrl] = useState<string | null>(null);
@@ -564,6 +590,7 @@ export default function KnockingDoorsPage() {
   const mapRef = useRef<any>(null);
   const mapsApiRef = useRef<any>(null);
   const markersRef = useRef<Map<string, any>>(new Map());
+  const heatmapCirclesRef = useRef<any[]>([]);
   const drawingManagerRef = useRef<any>(null);
   const routeCircleRef = useRef<any>(null);
   const routeCircleListenersRef = useRef<any[]>([]);
@@ -649,6 +676,7 @@ export default function KnockingDoorsPage() {
   const recomputeRouteCircleSelection = useCallback(
     (circle: any) => {
       if (!circle) {
+        setRouteCircleRadiusMilesInput("");
         setSelectedRoutePinKeys([]);
         return;
       }
@@ -656,9 +684,12 @@ export default function KnockingDoorsPage() {
       const center = circle.getCenter?.();
       const radiusMeters = Number(circle.getRadius?.());
       if (!center || !Number.isFinite(radiusMeters) || radiusMeters <= 0) {
+        setRouteCircleRadiusMilesInput("");
         setSelectedRoutePinKeys([]);
         return;
       }
+
+      setRouteCircleRadiusMilesInput((radiusMeters / 1609.344).toFixed(2));
 
       const centerLat = Number(center.lat?.());
       const centerLng = Number(center.lng?.());
@@ -1108,6 +1139,50 @@ export default function KnockingDoorsPage() {
 
   useEffect(() => {
     if (!user) return;
+    if (mapMode !== "heatmap") return;
+
+    let active = true;
+    const loadHeatmap = async () => {
+      setLoadingHeatmap(true);
+      setHeatmapError(null);
+      try {
+        const params = new URLSearchParams({
+          layer: heatmapLayer,
+          days: String(heatmapDays),
+        });
+        const response = await fetch(`/api/territory/heatmap?${params.toString()}`, {
+          cache: "no-store",
+          credentials: "include",
+        });
+        const payload = (await response.json()) as {
+          error?: string;
+          cells?: HeatmapCell[];
+        };
+        if (!response.ok) {
+          throw new Error(payload.error || `Heat map request failed (${response.status})`);
+        }
+
+        if (!active) return;
+        setHeatmapCells(Array.isArray(payload.cells) ? payload.cells : []);
+      } catch (fetchError) {
+        if (!active) return;
+        setHeatmapCells([]);
+        setHeatmapError(fetchError instanceof Error ? fetchError.message : "Could not load heat map.");
+      } finally {
+        if (active) {
+          setLoadingHeatmap(false);
+        }
+      }
+    };
+
+    void loadHeatmap();
+    return () => {
+      active = false;
+    };
+  }, [heatmapDays, heatmapLayer, mapMode, user]);
+
+  useEffect(() => {
+    if (!user) return;
     if (!mapNodeRef.current) return;
     let active = true;
 
@@ -1189,6 +1264,8 @@ export default function KnockingDoorsPage() {
       }
       markersRef.current.forEach((marker) => marker.setMap(null));
       markersRef.current.clear();
+      heatmapCirclesRef.current.forEach((circle) => circle.setMap(null));
+      heatmapCirclesRef.current = [];
     };
   }, [googleKey, user]);
 
@@ -1197,6 +1274,12 @@ export default function KnockingDoorsPage() {
 
     const maps = (window as Window & { google?: { maps?: any } }).google?.maps;
     if (!maps) return;
+
+    if (mapMode !== "pins") {
+      markersRef.current.forEach((marker) => marker.setMap(null));
+      markersRef.current.clear();
+      return;
+    }
 
     const nextIds = new Set(mapVisiblePins.map((pin) => normalizeAddress(pin.address)));
 
@@ -1251,7 +1334,70 @@ export default function KnockingDoorsPage() {
       });
       mapRef.current.fitBounds(bounds, 64);
     }
-  }, [mapReady, mapVisiblePins]);
+  }, [mapMode, mapReady, mapVisiblePins]);
+
+  useEffect(() => {
+    if (!mapReady || !mapRef.current) return;
+
+    const maps = (window as Window & { google?: { maps?: any } }).google?.maps;
+    if (!maps) return;
+
+    heatmapCirclesRef.current.forEach((circle) => circle.setMap(null));
+    heatmapCirclesRef.current = [];
+
+    if (mapMode !== "heatmap") {
+      return;
+    }
+
+    if (heatmapCells.length === 0) {
+      return;
+    }
+
+    const maxValue = Math.max(
+      0.0001,
+      ...heatmapCells.map((cell) => Number(cell.value || 0)),
+    );
+    const bounds = new maps.LatLngBounds();
+
+    heatmapCells.forEach((cell) => {
+      if (!Number.isFinite(cell.centerLat) || !Number.isFinite(cell.centerLng)) return;
+      const normalized = Math.max(0, Math.min(1, Number(cell.value || 0) / maxValue));
+      const circle = new maps.Circle({
+        map: mapRef.current,
+        center: { lat: cell.centerLat, lng: cell.centerLng },
+        radius: 200 + normalized * 650,
+        strokeColor: "#f97316",
+        strokeOpacity: 0.15 + normalized * 0.45,
+        strokeWeight: 1,
+        fillColor: "#f97316",
+        fillOpacity: 0.12 + normalized * 0.38,
+        clickable: true,
+      });
+
+      const info = new maps.InfoWindow({
+        content: `
+          <div style="font-family: system-ui; min-width: 220px;">
+            <strong>Heat Cell ${cell.hexKey}</strong><br/>
+            <span>Layer: ${heatmapLayer}</span><br/>
+            <span>Value: ${Number(cell.value).toFixed(3)}</span><br/>
+            <span>K ${cell.knocks} | T ${cell.talks} | I ${cell.inspections} | C ${cell.contingencies}</span>
+          </div>
+        `,
+      });
+
+      circle.addListener("click", () => {
+        info.setPosition({ lat: cell.centerLat, lng: cell.centerLng });
+        info.open({ map: mapRef.current });
+      });
+
+      heatmapCirclesRef.current.push(circle);
+      bounds.extend({ lat: cell.centerLat, lng: cell.centerLng });
+    });
+
+    if (!bounds.isEmpty()) {
+      mapRef.current.fitBounds(bounds, 64);
+    }
+  }, [heatmapCells, heatmapLayer, mapMode, mapReady]);
 
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
@@ -1292,6 +1438,7 @@ export default function KnockingDoorsPage() {
         }
 
         routeCircleRef.current = circle;
+        setHasRouteCircle(true);
         setIsDrawingRouteCircle(false);
         drawingManager.setDrawingMode(null);
         setRouteSummary(null);
@@ -1412,6 +1559,11 @@ export default function KnockingDoorsPage() {
   }
 
   function startRouteCircleDraw() {
+    if (mapMode !== "pins") {
+      setActionError("Switch to Lead Pins mode to draw routing circles.");
+      return;
+    }
+
     const maps =
       mapsApiRef.current ??
       (window as Window & { google?: { maps?: any } }).google?.maps;
@@ -1431,6 +1583,8 @@ export default function KnockingDoorsPage() {
       routeCircleRef.current.setMap(null);
       routeCircleRef.current = null;
     }
+    setHasRouteCircle(false);
+    setRouteCircleRadiusMilesInput("");
     setSelectedRoutePinKeys([]);
 
     drawingManagerRef.current?.setDrawingMode(maps.drawing.OverlayType.CIRCLE);
@@ -1448,8 +1602,27 @@ export default function KnockingDoorsPage() {
       routeCircleRef.current.setMap(null);
       routeCircleRef.current = null;
     }
+    setHasRouteCircle(false);
+    setRouteCircleRadiusMilesInput("");
     setSelectedRoutePinKeys([]);
     clearRenderedRoute();
+  }
+
+  function applyRouteCircleRadiusFromInput() {
+    if (!routeCircleRef.current) {
+      setActionError("Draw a circle first.");
+      return;
+    }
+
+    const miles = Number(routeCircleRadiusMilesInput);
+    if (!Number.isFinite(miles) || miles <= 0) {
+      setActionError("Radius must be a positive number of miles.");
+      return;
+    }
+
+    clearActionFeedback();
+    routeCircleRef.current.setRadius(miles * 1609.344);
+    recomputeRouteCircleSelection(routeCircleRef.current);
   }
 
   function openRouteStartPrompt() {
@@ -1959,6 +2132,8 @@ export default function KnockingDoorsPage() {
   return (
     <AppShell
       role={role}
+      profileName={fullName}
+      profileImageUrl={profileImageUrl}
       onSignOut={signOut}
       debug={{ userId: user.id, role, accessToken, authError }}
     >
@@ -1976,24 +2151,93 @@ export default function KnockingDoorsPage() {
             : "Rep view: your knocked doors and your potential leads entered through the app."}
         </p>
 
-        <label className="stack" style={{ marginTop: 8 }}>
-          Search List
-          <input
-            value={searchTerm}
-            onChange={(event) => setSearchTerm(event.target.value)}
-            placeholder="Filter by address, homeowner, or outcome"
-          />
-        </label>
+        <div className="tabs" style={{ marginTop: 8 }}>
+          <button
+            type="button"
+            className={mapMode === "pins" ? "tab tab-active" : "tab"}
+            onClick={() => setMapMode("pins")}
+          >
+            Lead Pins
+          </button>
+          <button
+            type="button"
+            className={mapMode === "heatmap" ? "tab tab-active" : "tab"}
+            onClick={() => setMapMode("heatmap")}
+          >
+            Heat Map
+          </button>
+        </div>
+
+        {mapMode === "pins" ? (
+          <label className="stack" style={{ marginTop: 8 }}>
+            Search List
+            <input
+              value={searchTerm}
+              onChange={(event) => setSearchTerm(event.target.value)}
+              placeholder="Filter by address, homeowner, or outcome"
+            />
+          </label>
+        ) : (
+          <div className="row" style={{ marginTop: 10, gap: 8, flexWrap: "wrap" }}>
+            <label className="hint">
+              Layer
+              <select
+                value={heatmapLayer}
+                onChange={(event) => setHeatmapLayer(event.target.value as HeatmapLayer)}
+                style={{ marginLeft: 6 }}
+              >
+                {HEATMAP_LAYERS.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="hint">
+              Window
+              <select
+                value={String(heatmapDays)}
+                onChange={(event) => setHeatmapDays(Number(event.target.value))}
+                style={{ marginLeft: 6 }}
+              >
+                <option value="7">7d</option>
+                <option value="30">30d</option>
+                <option value="90">90d</option>
+              </select>
+            </label>
+            <label className="hint">
+              Custom Days
+              <input
+                type="number"
+                min={1}
+                max={365}
+                value={String(heatmapDays)}
+                onChange={(event) => {
+                  const next = Number(event.target.value);
+                  if (Number.isFinite(next) && next > 0) {
+                    setHeatmapDays(Math.min(365, Math.round(next)));
+                  }
+                }}
+                style={{ marginLeft: 6, width: 86 }}
+              />
+            </label>
+            <span className="hint">{heatmapCells.length} heat cell(s)</span>
+          </div>
+        )}
 
         {actionError ? <p className="error">{actionError}</p> : null}
         {actionMessage ? <p className="hint">{actionMessage}</p> : null}
         {loadingPins ? <p className="hint">Loading knocked doors...</p> : null}
+        {loadingHeatmap ? <p className="hint">Loading heat map...</p> : null}
+        {heatmapError ? <p className="error">{heatmapError}</p> : null}
         {!mapReady && !mapError ? <p className="hint">Initializing map...</p> : null}
         {mapError ? <p className="error">{mapError}</p> : null}
         {dataError ? <p className="error">{dataError}</p> : null}
         {dataMessage ? <p className="hint">{dataMessage}</p> : null}
 
         <div ref={mapNodeRef} className="live-map" />
+        {mapMode === "pins" ? (
+        <>
         <div className="row" style={{ marginTop: 10, gap: 8, flexWrap: "wrap" }}>
           <button
             type="button"
@@ -2001,7 +2245,7 @@ export default function KnockingDoorsPage() {
             onClick={startRouteCircleDraw}
             disabled={!mapReady}
           >
-            {isDrawingRouteCircle ? "Drawing..." : "Draw Route Circle"}
+            {isDrawingRouteCircle ? "Drawing..." : "Draw Custom Circle"}
           </button>
           <button
             type="button"
@@ -2022,10 +2266,41 @@ export default function KnockingDoorsPage() {
             Selected leads in circle: {selectedRoutePins.length}
           </span>
         </div>
+        {hasRouteCircle ? (
+          <div className="row" style={{ marginTop: 8, gap: 8, flexWrap: "wrap" }}>
+            <label className="hint" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              Circle radius (miles)
+              <input
+                type="number"
+                min="0.05"
+                step="0.05"
+                value={routeCircleRadiusMilesInput}
+                onChange={(event) =>
+                  setRouteCircleRadiusMilesInput(event.target.value)
+                }
+                style={{ width: 110, padding: "6px 8px" }}
+              />
+            </label>
+            <button
+              type="button"
+              className="secondary"
+              onClick={applyRouteCircleRadiusFromInput}
+              disabled={!mapReady}
+            >
+              Apply Radius
+            </button>
+          </div>
+        ) : null}
         {isDrawingRouteCircle ? (
           <p className="hint">
-            Draw mode is active: click and drag on the map to create the route
-            circle.
+            Draw mode is active: click and drag on the map to create your custom
+            route circle.
+          </p>
+        ) : null}
+        {hasRouteCircle && !isDrawingRouteCircle ? (
+          <p className="hint">
+            Tip: drag the circle to reposition it, or drag the edge to resize for
+            precise pin selection.
           </p>
         ) : null}
         {routeSummary ? (
@@ -2115,6 +2390,10 @@ export default function KnockingDoorsPage() {
             </div>
           </div>
         ) : null}
+        </>
+        ) : null}
+        {mapMode === "pins" ? (
+        <>
         <div
           style={{
             marginTop: 10,
@@ -2179,8 +2458,10 @@ export default function KnockingDoorsPage() {
           Map status filters: {activeMapStatusFilters.length}/
           {LEAD_STATUS_LEGEND.length} selected
         </p>
+        </>
+        ) : null}
 
-        {visiblePins.length > 0 ? (
+        {mapMode === "pins" && visiblePins.length > 0 ? (
           <div className="jobs" style={{ marginTop: 12 }}>
             {visiblePins.map((pin) => {
               const pinKey = normalizeAddress(pin.address);
@@ -2813,11 +3094,15 @@ export default function KnockingDoorsPage() {
               </p>
             ) : null}
           </div>
-        ) : (
+        ) : mapMode === "pins" ? (
           <p className="hint" style={{ marginTop: 12 }}>
             {pins.length === 0
               ? "No knocked doors or potential leads found."
               : "No addresses match your search filter."}
+          </p>
+        ) : (
+          <p className="hint" style={{ marginTop: 12 }}>
+            Heat map mode hides pin editing and route tools. Switch back to Lead Pins to edit lead records.
           </p>
         )}
       </section>

@@ -6,18 +6,42 @@ import { AppShell } from "@/components/AppShell";
 import { StatusPill } from "@/components/StatusPill";
 import { crmApi } from "@/lib/crm-api";
 import { formatDate, notificationText, taskLabel } from "@/lib/format";
+import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 import { useAuthSession } from "@/lib/use-auth-session";
-import type { NotificationRecord, TaskRecord } from "@/types/models";
+import type { JsonRecord, NotificationRecord, TaskRecord } from "@/types/models";
+
+type FieldNotificationRow = JsonRecord & {
+  id: string;
+  rep_id?: string | null;
+  title?: string | null;
+  message?: string | null;
+  category?: string | null;
+  payload?: Record<string, unknown> | null;
+  is_read?: boolean | null;
+  created_at?: string | null;
+};
 
 export default function NotificationsPage() {
   const router = useRouter();
-  const { user, loading, role, signOut, accessToken, error: authError } = useAuthSession();
+  const {
+    user,
+    loading,
+    role,
+    signOut,
+    accessToken,
+    error: authError,
+    profileImageUrl,
+    fullName,
+  } = useAuthSession();
+  const supabase = getSupabaseBrowserClient();
 
   const [items, setItems] = useState<NotificationRecord[]>([]);
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
+  const [fieldItems, setFieldItems] = useState<FieldNotificationRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [loadingItems, setLoadingItems] = useState(true);
   const [loadingTasks, setLoadingTasks] = useState(true);
+  const [loadingFieldItems, setLoadingFieldItems] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
   const [markingAll, setMarkingAll] = useState(false);
@@ -66,9 +90,40 @@ export default function NotificationsPage() {
     }
   };
 
+  const loadFieldNotifications = async () => {
+    if (!user) return;
+    setLoadingFieldItems(true);
+    try {
+      const { data, error: fieldError } = await supabase
+        .from("notifications")
+        .select("id,rep_id,title,message,category,payload,is_read,created_at")
+        .or(`rep_id.eq.${user.id},rep_id.is.null`)
+        .order("created_at", { ascending: false })
+        .limit(100);
+
+      if (fieldError) {
+        const lower = fieldError.message.toLowerCase();
+        if (lower.includes("does not exist") || lower.includes("relation")) {
+          setFieldItems([]);
+          return;
+        }
+        throw fieldError;
+      }
+
+      setFieldItems((data ?? []) as FieldNotificationRow[]);
+    } catch (fieldLoadError) {
+      const message =
+        fieldLoadError instanceof Error ? fieldLoadError.message : "Failed to load field notifications.";
+      setError((previous) => (previous ? `${previous} | ${message}` : message));
+      setFieldItems([]);
+    } finally {
+      setLoadingFieldItems(false);
+    }
+  };
+
   useEffect(() => {
     if (!user || !accessToken) return;
-    void Promise.all([loadNotifications(), loadTasks()]);
+    void Promise.all([loadNotifications(), loadTasks(), loadFieldNotifications()]);
   }, [accessToken, user]);
 
   useEffect(() => {
@@ -81,6 +136,7 @@ export default function NotificationsPage() {
     if (!loading && user && !accessToken) {
       setLoadingItems(false);
       setLoadingTasks(false);
+      setLoadingFieldItems(false);
       setError("Session token missing. Please sign out and sign in again.");
     }
   }, [accessToken, loading, user]);
@@ -180,6 +236,8 @@ export default function NotificationsPage() {
   return (
     <AppShell
       role={role}
+      profileName={fullName}
+      profileImageUrl={profileImageUrl}
       onSignOut={signOut}
       debug={{
         userId: user.id,
@@ -228,6 +286,41 @@ export default function NotificationsPage() {
           })}
           {!loadingItems && items.length === 0 ? (
             <p className="hint">No notifications available.</p>
+          ) : null}
+        </div>
+
+        <div className="row" style={{ marginTop: 14 }}>
+          <h3 style={{ margin: 0 }}>Field Reports + Sync</h3>
+          <p className="hint">{fieldItems.length} loaded</p>
+        </div>
+        {loadingFieldItems ? <p className="hint">Loading field notifications...</p> : null}
+        <div className="grid">
+          {fieldItems.map((item) => (
+            <article key={item.id} className="job-card">
+              <div className="row">
+                <strong>{item.title || item.message || "Field Notification"}</strong>
+                <StatusPill value={item.is_read ? "read" : "unread"} />
+              </div>
+              <p className="hint">
+                {item.category ? `Category: ${item.category}` : "Category: uncategorized"}
+              </p>
+              <p className="hint">{formatDate(item.created_at ?? undefined)}</p>
+              {item.payload ? (
+                <pre
+                  style={{
+                    whiteSpace: "pre-wrap",
+                    overflowWrap: "anywhere",
+                    fontSize: "0.75rem",
+                    margin: 0,
+                  }}
+                >
+                  {JSON.stringify(item.payload, null, 2)}
+                </pre>
+              ) : null}
+            </article>
+          ))}
+          {!loadingFieldItems && fieldItems.length === 0 ? (
+            <p className="hint">No field report/sync notifications yet.</p>
           ) : null}
         </div>
 

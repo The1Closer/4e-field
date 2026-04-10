@@ -123,7 +123,16 @@ function haversineMiles(
 
 export default function JobsPage() {
   const router = useRouter();
-  const { user, loading, role, signOut, accessToken, error: authError } = useAuthSession();
+  const {
+    user,
+    loading,
+    role,
+    signOut,
+    accessToken,
+    error: authError,
+    profileImageUrl,
+    fullName,
+  } = useAuthSession();
 
   const [supabaseReady, setSupabaseReady] = useState(false);
   const [dailyNumbers, setDailyNumbers] = useState<DailyNumbers>(DEFAULT_DAILY_NUMBERS);
@@ -423,6 +432,8 @@ export default function JobsPage() {
   return (
     <AppShell
       role={role}
+      profileName={fullName}
+      profileImageUrl={profileImageUrl}
       onSignOut={signOut}
       debug={{
         userId: user.id,

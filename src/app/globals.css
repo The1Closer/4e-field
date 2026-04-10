@@ -154,39 +154,95 @@ select {
 .shell-brand {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
 }
 
 .shell-brand-mark {
   display: inline-flex;
-  width: 38px;
-  height: 38px;
+  width: 50px;
+  height: 50px;
   align-items: center;
   justify-content: center;
 }
 
 .shell-brand-logo {
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
+  width: 50px;
+  height: 50px;
+  border-radius: 12px;
 }
 
 .shell-brand-text {
   display: grid;
-  gap: 1px;
+  gap: 2px;
   line-height: 1.1;
 }
 
 .shell-brand-text strong {
-  font-size: 1rem;
-  letter-spacing: 0.01em;
+  font-size: 1.2rem;
+  letter-spacing: 0.015em;
 }
 
 .shell-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.profile-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel-soft);
+  border-radius: 999px;
+  padding: 5px 12px 5px 5px;
+}
+
+.profile-avatar {
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel-soft-hover);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.profile-avatar svg {
+  width: 22px;
+  height: 22px;
+  stroke: var(--ink-soft);
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.profile-avatar-image {
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+  object-fit: cover;
+  display: block;
+}
+
+.profile-chip-text {
+  display: grid;
+  line-height: 1.06;
+}
+
+.profile-name {
+  font-size: 0.96rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+.profile-role {
+  font-size: 0.78rem;
+  text-transform: capitalize;
 }
 
 .bell-btn {
@@ -804,9 +860,13 @@ button.danger:hover {
   border: 0;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 767px) {
   .layout {
     padding: 0 12px;
+  }
+
+  .profile-chip {
+    display: none;
   }
 
   .shell-actions button.secondary:not(.theme-toggle) {
@@ -827,7 +887,41 @@ button.danger:hover {
   }
 }
 
-@media (min-width: 901px) {
+@media (min-width: 768px) {
+  .layout {
+    padding: 0 18px;
+  }
+
+  .shell-brand {
+    gap: 14px;
+  }
+
+  .shell-brand-mark {
+    width: 58px;
+    height: 58px;
+  }
+
+  .shell-brand-logo {
+    width: 58px;
+    height: 58px;
+    border-radius: 14px;
+  }
+
+  .shell-brand-text strong {
+    font-size: 1.42rem;
+    letter-spacing: 0.02em;
+  }
+
+  .shell-header-inner {
+    gap: 14px;
+    padding-top: 14px;
+    padding-bottom: 14px;
+  }
+
+  .panel {
+    padding: 18px;
+  }
+
   .jobs-home-columns {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: start;
@@ -852,5 +946,37 @@ button.danger:hover {
   .shell-main {
     padding-top: 18px;
     padding-bottom: 40px;
+  }
+}
+
+@media (min-width: 1200px) {
+  .layout {
+    max-width: 1280px;
+    padding: 0 20px;
+  }
+
+  .shell-header-inner {
+    padding-top: 15px;
+    padding-bottom: 15px;
+  }
+
+  .shell-brand-text strong {
+    font-size: 1.6rem;
+    letter-spacing: 0.024em;
+  }
+
+  .shell-brand-mark {
+    width: 64px;
+    height: 64px;
+  }
+
+  .shell-brand-logo {
+    width: 64px;
+    height: 64px;
+    border-radius: 15px;
+  }
+
+  .panel {
+    padding: 20px;
   }
 }

@@ -11,6 +11,7 @@ type AuthState = {
   user: User | null;
   role: UserRole | null;
   fullName: string | null;
+  profileImageUrl: string | null;
   includeInNightlyNumbers: boolean;
   error: string | null;
 };
@@ -38,6 +39,30 @@ function getRoleFromUserMetadata(user: User | null): UserRole | null {
   return null;
 }
 
+function getProfileImageFromUserMetadata(user: User | null) {
+  if (!user) return null;
+
+  const candidates = [
+    user.user_metadata?.avatar_url,
+    user.user_metadata?.picture,
+    user.user_metadata?.photo_url,
+    user.user_metadata?.profile_picture,
+    user.user_metadata?.profile_image,
+    user.user_metadata?.image,
+    user.app_metadata?.avatar_url,
+    user.app_metadata?.picture,
+    user.app_metadata?.photo_url,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+
+  return null;
+}
+
 export function useAuthSession() {
   const [supabase, setSupabase] = useState<SupabaseClient | null>(null);
   const [state, setState] = useState<AuthState>({
@@ -46,6 +71,7 @@ export function useAuthSession() {
     user: null,
     role: null,
     fullName: null,
+    profileImageUrl: null,
     includeInNightlyNumbers: false,
     error: null,
   });
@@ -62,7 +88,7 @@ export function useAuthSession() {
     const loadProfile = async (userId: string) => {
       const { data, error } = await supabase
         .from("profiles")
-        .select("role,full_name,include_in_nightly_numbers")
+        .select("role,full_name,include_in_nightly_numbers,avatar_url")
         .eq("id", userId)
         .maybeSingle();
 
@@ -73,6 +99,7 @@ export function useAuthSession() {
       return {
         role: isRole(data?.role) ? data.role : null,
         fullName: typeof data?.full_name === "string" ? data.full_name : null,
+        avatarUrl: typeof data?.avatar_url === "string" ? data.avatar_url : null,
         includeInNightlyNumbers: Boolean(data?.include_in_nightly_numbers),
       };
     };
@@ -91,6 +118,7 @@ export function useAuthSession() {
           typeof currentUser?.user_metadata?.full_name === "string"
             ? String(currentUser.user_metadata.full_name)
             : null,
+        profileImageUrl: getProfileImageFromUserMetadata(currentUser),
         includeInNightlyNumbers: false,
         error: null,
       }));
@@ -111,6 +139,7 @@ export function useAuthSession() {
               ...previous,
               role: dbProfile.role ?? previous.role,
               fullName: dbProfile.fullName ?? previous.fullName,
+              profileImageUrl: dbProfile.avatarUrl ?? previous.profileImageUrl,
               includeInNightlyNumbers: dbProfile.includeInNightlyNumbers,
             };
           });

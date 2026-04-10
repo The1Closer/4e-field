@@ -64,6 +64,24 @@ type RepKnockSummary = {
   knockSecondsWeek: number;
 };
 
+type RepPerformanceApiRow = {
+  repId: string;
+  periodType: "weekly" | "monthly";
+  periodStart: string;
+  periodEnd: string;
+  timezone: string;
+  weekStartDow: number;
+  metrics: {
+    knocks: number;
+    talks: number;
+    inspections: number;
+    contingencies: number;
+    talkRate: number;
+    inspectionRate: number;
+    contingencyRate: number;
+  };
+};
+
 function formatDateTime(value: string | null | undefined) {
   if (!value) return "-";
   const parsed = new Date(value);
@@ -119,7 +137,16 @@ function formatDurationHours(seconds: number) {
 
 export default function KnockingLivePage() {
   const router = useRouter();
-  const { user, loading, role, signOut, accessToken, error: authError } = useAuthSession();
+  const {
+    user,
+    loading,
+    role,
+    signOut,
+    accessToken,
+    error: authError,
+    profileImageUrl,
+    fullName,
+  } = useAuthSession();
   const [rows, setRows] = useState<LiveSessionRow[]>([]);
   const [events, setEvents] = useState<KnockEventSummaryRow[]>([]);
   const [sessionHistory, setSessionHistory] = useState<SessionHistoryRow[]>([]);
@@ -129,6 +156,10 @@ export default function KnockingLivePage() {
   const [mapError, setMapError] = useState<string | null>(null);
   const [loadingRows, setLoadingRows] = useState(true);
   const [mapReady, setMapReady] = useState(false);
+  const [reportPeriod, setReportPeriod] = useState<"weekly" | "monthly">("weekly");
+  const [repPerformanceRows, setRepPerformanceRows] = useState<RepPerformanceApiRow[]>([]);
+  const [loadingRepPerformance, setLoadingRepPerformance] = useState(false);
+  const [repPerformanceError, setRepPerformanceError] = useState<string | null>(null);
 
   const supabase = getSupabaseBrowserClient();
   const googleKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
@@ -363,6 +394,51 @@ export default function KnockingLivePage() {
     if (!user || !managerLike(role)) return;
     let active = true;
 
+    const loadRepPerformance = async () => {
+      setLoadingRepPerformance(true);
+      setRepPerformanceError(null);
+      try {
+        const response = await fetch(`/api/reports/rep-performance?period=${reportPeriod}`, {
+          cache: "no-store",
+          credentials: "include",
+        });
+        const payload = (await response.json()) as {
+          error?: string;
+          reports?: RepPerformanceApiRow[];
+        };
+        if (!response.ok) {
+          throw new Error(payload.error || `Failed to load rep performance (${response.status})`);
+        }
+        if (!active) return;
+        setRepPerformanceRows(Array.isArray(payload.reports) ? payload.reports : []);
+      } catch (loadError) {
+        if (!active) return;
+        setRepPerformanceRows([]);
+        setRepPerformanceError(
+          loadError instanceof Error ? loadError.message : "Could not load rep performance reports.",
+        );
+      } finally {
+        if (active) {
+          setLoadingRepPerformance(false);
+        }
+      }
+    };
+
+    void loadRepPerformance();
+    const intervalId = window.setInterval(() => {
+      void loadRepPerformance();
+    }, 120000);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [reportPeriod, role, user]);
+
+  useEffect(() => {
+    if (!user || !managerLike(role)) return;
+    let active = true;
+
     const loadAnalytics = async () => {
       const weekStartIso = getStartOfWeekLocal().toISOString();
       const nowIso = new Date().toISOString();
@@ -535,7 +611,13 @@ export default function KnockingLivePage() {
 
   if (!managerLike(role)) {
     return (
-      <AppShell role={role} onSignOut={signOut} debug={{ userId: user.id, role, accessToken, authError }}>
+      <AppShell
+        role={role}
+        profileName={fullName}
+        profileImageUrl={profileImageUrl}
+        onSignOut={signOut}
+        debug={{ userId: user.id, role, accessToken, authError }}
+      >
         <section className="panel">
           <h2 style={{ margin: 0 }}>Management</h2>
           <p className="error">Manager role required.</p>
@@ -545,7 +627,13 @@ export default function KnockingLivePage() {
   }
 
   return (
-    <AppShell role={role} onSignOut={signOut} debug={{ userId: user.id, role, accessToken, authError }}>
+    <AppShell
+      role={role}
+      profileName={fullName}
+      profileImageUrl={profileImageUrl}
+      onSignOut={signOut}
+      debug={{ userId: user.id, role, accessToken, authError }}
+    >
       <section className="panel">
         <div className="row">
           <h2 style={{ margin: 0 }}>Management</h2>
@@ -600,6 +688,61 @@ export default function KnockingLivePage() {
             ))}
             {!loadingRows && repKnockSummaries.length === 0 ? (
               <p className="hint">No knock totals available yet for this week.</p>
+            ) : null}
+          </div>
+        </details>
+
+        <details className="job-card" style={{ marginTop: 12 }}>
+          <summary className="row" style={{ cursor: "pointer" }}>
+            <strong>Rep Performance Reports</strong>
+            <span className="hint">{repPerformanceRows.length} row(s)</span>
+          </summary>
+          <div className="row" style={{ marginTop: 10, gap: 8 }}>
+            <button
+              type="button"
+              className={reportPeriod === "weekly" ? "" : "secondary"}
+              onClick={() => setReportPeriod("weekly")}
+            >
+              Weekly
+            </button>
+            <button
+              type="button"
+              className={reportPeriod === "monthly" ? "" : "secondary"}
+              onClick={() => setReportPeriod("monthly")}
+            >
+              Monthly
+            </button>
+          </div>
+          <p className="hint" style={{ marginTop: 8 }}>
+            Sunday week start, rep-local timezone.
+          </p>
+          {loadingRepPerformance ? <p className="hint">Loading report snapshot...</p> : null}
+          {repPerformanceError ? <p className="error">{repPerformanceError}</p> : null}
+          <div className="grid" style={{ marginTop: 8 }}>
+            {repPerformanceRows.map((report) => {
+              const repName = profileNames[report.repId] || report.repId;
+              return (
+                <article key={`${report.repId}-${report.periodStart}-${report.periodEnd}`} className="job-card">
+                  <div className="row">
+                    <strong>{repName}</strong>
+                    <span className="hint">
+                      {report.periodStart} to {report.periodEnd}
+                    </span>
+                  </div>
+                  <p className="hint">
+                    K {toNumber(report.metrics.knocks)} | T {toNumber(report.metrics.talks)} | I{" "}
+                    {toNumber(report.metrics.inspections)} | C {toNumber(report.metrics.contingencies)}
+                  </p>
+                  <p className="hint">
+                    Talk {(toNumber(report.metrics.talkRate) * 100).toFixed(1)}% | Inspection{" "}
+                    {(toNumber(report.metrics.inspectionRate) * 100).toFixed(1)}% | Contingency{" "}
+                    {(toNumber(report.metrics.contingencyRate) * 100).toFixed(1)}%
+                  </p>
+                </article>
+              );
+            })}
+            {!loadingRepPerformance && repPerformanceRows.length === 0 ? (
+              <p className="hint">No report snapshots available for this period.</p>
             ) : null}
           </div>
         </details>
