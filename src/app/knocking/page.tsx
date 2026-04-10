@@ -1928,6 +1928,7 @@ export default function KnockingPage() {
     outcome?: KnockOutcome | null;
     homeownerRequired?: boolean;
     contingentOverride?: boolean;
+    skipGuidedInspection?: boolean;
   }) {
     if (!session || !user || !accessToken) return;
     if (session.status !== "active") {
@@ -1979,19 +1980,24 @@ export default function KnockingPage() {
           homeowner_phone: homeownerIntake.phone.trim() || null,
           homeowner_email: homeownerIntake.email.trim() || null,
           metadata: isInspection
-            ? {
-                checklist: inspectionSnapshot,
-                photos: inspectionPhotos.map((photo) => ({
-                  file_name: photo.file.name,
-                  capture_section: photo.captureSection,
-                  damage_cause: photo.damageCause,
-                  slope_tag: photo.slopeTag || null,
-                  component_tag: photo.componentTag,
-                  custom_tag: photo.customTag || null,
-                  note: photo.note,
-                })),
-                queued_offline: true,
-              }
+            ? params.skipGuidedInspection
+              ? {
+                  guided_inspection_skipped: true,
+                  queued_offline: true,
+                }
+              : {
+                  checklist: inspectionSnapshot,
+                  photos: inspectionPhotos.map((photo) => ({
+                    file_name: photo.file.name,
+                    capture_section: photo.captureSection,
+                    damage_cause: photo.damageCause,
+                    slope_tag: photo.slopeTag || null,
+                    component_tag: photo.componentTag,
+                    custom_tag: photo.customTag || null,
+                    note: photo.note,
+                  })),
+                  queued_offline: true,
+                }
             : { queued_offline: true },
         });
 
@@ -2106,7 +2112,7 @@ export default function KnockingPage() {
         linkedTaskId = typeof taskResult.taskId === "string" ? taskResult.taskId : null;
       }
 
-      if (isInspection && linkedJobId) {
+      if (isInspection && linkedJobId && !params.skipGuidedInspection) {
         try {
           let freshlySavedSignature: RepSignatureRow | null = null;
           if (!signatureRecordId && signatureDrawn) {
@@ -2467,7 +2473,11 @@ export default function KnockingPage() {
         linked_task_id: linkedTaskId,
         is_locked: Boolean(linkedJobId || linkedTaskId),
         metadata: isInspection
+          ? params.skipGuidedInspection
             ? {
+                guided_inspection_skipped: true,
+              }
+            : {
                 checklist: inspectionSnapshot,
                 photo_count: inspectionPhotos.length,
                 inspection_id: inspectionRecordId,
@@ -2527,6 +2537,8 @@ export default function KnockingPage() {
       const baseMessage =
         completionModalState
           ? "Inspection completed. PDF report is ready below."
+          : isInspection && params.skipGuidedInspection
+            ? "Inspection logged with homeowner info only. Guided inspection was skipped."
           : includeInNightlyNumbers
             ? "Event logged and nightly numbers synced."
             : "Event logged. Nightly sync skipped (not on nightly roster).";
@@ -2549,10 +2561,14 @@ export default function KnockingPage() {
             homeowner_phone: homeownerIntake.phone.trim() || null,
             homeowner_email: homeownerIntake.email.trim() || null,
             metadata: isInspectionEvent
-              ? {
-                  checklist: inspectionChecklist,
-                  photo_count: inspectionPhotos.length,
-                }
+              ? params.skipGuidedInspection
+                ? {
+                    guided_inspection_skipped: true,
+                  }
+                : {
+                    checklist: inspectionChecklist,
+                    photo_count: inspectionPhotos.length,
+                  }
               : {},
           });
           setError(null);
@@ -2910,10 +2926,29 @@ export default function KnockingPage() {
                 ariaLabel="Homeowner address"
               />
             </label>
-            <button type="submit">Continue</button>
-            <button type="button" className="secondary" onClick={() => setStep("outcome")}>
-              Back
-            </button>
+            <div className="row">
+              <button type="submit">Continue</button>
+              {eventOutcome === "inspection" ? (
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={saving}
+                  onClick={() =>
+                    void logEvent({
+                      action: "knock",
+                      outcome: "inspection",
+                      homeownerRequired: true,
+                      skipGuidedInspection: true,
+                    })
+                  }
+                >
+                  {saving ? "Saving..." : "Save Homeowner Only"}
+                </button>
+              ) : null}
+              <button type="button" className="secondary" onClick={() => setStep("outcome")} disabled={saving}>
+                Back
+              </button>
+            </div>
           </form>
         ) : null}
 
