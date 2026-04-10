@@ -167,6 +167,32 @@ export default function KnockingLivePage() {
   const mapNodeRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const markersRef = useRef<Map<string, any>>(new Map());
+  const timeoutSweepWarnedRef = useRef(false);
+
+  async function runInactivityTimeoutSweep() {
+    const { error: timeoutError } = await supabase.rpc("timeout_stale_knock_sessions", {
+      inactivity_minutes: 30,
+    });
+
+    if (!timeoutError) return;
+
+    const normalized = timeoutError.message.toLowerCase();
+    const migrationMissing =
+      (normalized.includes("function") && normalized.includes("does not exist")) ||
+      normalized.includes("timeout_stale_knock_sessions");
+
+    if (migrationMissing) {
+      if (!timeoutSweepWarnedRef.current) {
+        console.warn(
+          "Knocking live: session timeout migration is not applied yet (timeout_stale_knock_sessions).",
+        );
+        timeoutSweepWarnedRef.current = true;
+      }
+      return;
+    }
+
+    console.warn("Knocking live: could not run session inactivity timeout sweep.", timeoutError);
+  }
 
   const mappableRows = useMemo(
     () =>
@@ -356,6 +382,7 @@ export default function KnockingLivePage() {
       if (firstLoad) {
         setLoadingRows(true);
       }
+      await runInactivityTimeoutSweep();
 
       const sessionsResult = await supabase
         .from("knock_sessions")

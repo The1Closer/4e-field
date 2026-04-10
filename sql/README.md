@@ -21,6 +21,7 @@ Run these in order in Supabase SQL editor.
 17. `017_rollup_indexes_and_realtime.sql`
 18. `018_guided_inspection_workflow_v2.sql`
 19. `019_manager_delete_knock_events.sql`
+20. `020_knock_session_inactivity_timeout.sql`
 
 Notes:
 - Files are idempotent-safe where practical (`if not exists`, policy guards).

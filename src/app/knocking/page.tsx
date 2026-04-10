@@ -517,6 +517,7 @@ export default function KnockingPage() {
   const addressTouchedRef = useRef(false);
   const signatureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const signatureDrawingRef = useRef(false);
+  const timeoutSweepWarnedRef = useRef(false);
 
   const geocodeApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
@@ -633,6 +634,31 @@ export default function KnockingPage() {
     } finally {
       setSyncingNow(false);
     }
+  }
+
+  async function runInactivityTimeoutSweep() {
+    const { error: timeoutError } = await supabase.rpc("timeout_stale_knock_sessions", {
+      inactivity_minutes: 30,
+    });
+
+    if (!timeoutError) return;
+
+    const normalized = timeoutError.message.toLowerCase();
+    const migrationMissing =
+      (normalized.includes("function") && normalized.includes("does not exist")) ||
+      normalized.includes("timeout_stale_knock_sessions");
+
+    if (migrationMissing) {
+      if (!timeoutSweepWarnedRef.current) {
+        console.warn(
+          "Knocking: session timeout migration is not applied yet (timeout_stale_knock_sessions).",
+        );
+        timeoutSweepWarnedRef.current = true;
+      }
+      return;
+    }
+
+    console.warn("Knocking: could not run session inactivity timeout sweep.", timeoutError);
   }
 
   function updateInspectionComponent(componentKey: string, isPresent: boolean) {
@@ -1173,6 +1199,7 @@ export default function KnockingPage() {
 
     const loadState = async () => {
       setError(null);
+      await runInactivityTimeoutSweep();
 
       const today = getTodayLocalDate();
       const [sessionResult, statsResult] = await Promise.all([
@@ -1673,6 +1700,7 @@ export default function KnockingPage() {
     setError(null);
 
     try {
+      await runInactivityTimeoutSweep();
       const nowIso = new Date().toISOString();
       const payload = {
         rep_id: user.id,
