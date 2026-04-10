@@ -581,7 +581,7 @@ export default function KnockingLivePage() {
         });
 
         const infoHtml = `
-          <div style="font-family: system-ui; min-width: 210px;">
+          <div style="font-family: system-ui; min-width: 210px; color: var(--ink); background: var(--panel); padding: 4px 6px; border-radius: 8px;">
             <strong>${String(row.rep_name ?? row.rep_id)}</strong><br/>
             <span>${statusLabel(row.status)}</span><br/>
             <span>${String(row.latest_address ?? "No address")}</span><br/>

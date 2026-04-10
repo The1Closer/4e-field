@@ -415,6 +415,26 @@ textarea::placeholder {
   color: var(--ink-faint);
 }
 
+option {
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.gm-style .gm-style-iw-c {
+  background: var(--panel) !important;
+  color: var(--ink) !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: var(--shadow-soft) !important;
+}
+
+.gm-style .gm-style-iw-d {
+  color: var(--ink) !important;
+}
+
+.gm-style .gm-style-iw-t::after {
+  background: var(--panel) !important;
+}
+
 button {
   border: 1px solid transparent;
   border-radius: 10px;

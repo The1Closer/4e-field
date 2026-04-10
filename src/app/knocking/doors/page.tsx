@@ -81,6 +81,7 @@ type DoorPin = {
   lat: number | null;
   lng: number | null;
   knocks: number;
+  knockEventIds: string[];
   potentialLeadCount: number;
   lastKnockedAt: string | null;
   lastOutcome: string | null;
@@ -110,6 +111,7 @@ type DoorPinAggregate = DoorPin & {
   linkedJobIds: Set<string>;
   hasContingencyEvent: boolean;
   leadStatusUpdatedAtMs: number;
+  knockEventIdSet: Set<string>;
 };
 
 type RouteSummary = {
@@ -229,7 +231,7 @@ function getLeadStatusMarkerIcon(maps: any, status: LeadStatus | null) {
 
 function getMarkerInfoWindowContent(pin: DoorPin) {
   return `
-    <div style="font-family: system-ui; min-width: 240px;">
+    <div style="font-family: system-ui; min-width: 240px; color: var(--ink); background: var(--panel); padding: 4px 6px; border-radius: 8px;">
       <strong>${pin.address}</strong><br/>
       <span>${pin.knocks > 0 ? `Knocks: ${pin.knocks}` : `Potential leads: ${pin.potentialLeadCount}`}</span><br/>
       <span>Last activity: ${formatDateTime(pin.lastKnockedAt)}</span><br/>
@@ -555,6 +557,7 @@ export default function KnockingDoorsPage() {
   const [savingNewAddressKey, setSavingNewAddressKey] = useState<string | null>(
     null,
   );
+  const [deletingPinKey, setDeletingPinKey] = useState<string | null>(null);
   const [uploadingLeadId, setUploadingLeadId] = useState<string | null>(null);
   const [openingDocumentId, setOpeningDocumentId] = useState<string | null>(
     null,
@@ -845,6 +848,7 @@ export default function KnockingDoorsPage() {
             lat,
             lng,
             knocks: 1,
+            knockEventIds: [],
             potentialLeadCount: 0,
             lastKnockedAt:
               typeof row.created_at === "string" ? row.created_at : null,
@@ -865,11 +869,15 @@ export default function KnockingDoorsPage() {
               : new Set<string>(),
             hasContingencyEvent: contingenciesDelta > 0,
             leadStatusUpdatedAtMs: 0,
+            knockEventIdSet: row.id ? new Set([row.id]) : new Set<string>(),
           });
           return;
         }
 
         existing.knocks += 1;
+        if (row.id) {
+          existing.knockEventIdSet.add(row.id);
+        }
         if (existing.lat === null && lat !== null) existing.lat = lat;
         if (existing.lng === null && lng !== null) existing.lng = lng;
         if (!existing.lastKnockedAt && typeof row.created_at === "string") {
@@ -925,6 +933,7 @@ export default function KnockingDoorsPage() {
             lat,
             lng,
             knocks: 0,
+            knockEventIds: [],
             potentialLeadCount: 1,
             lastKnockedAt:
               typeof lead.created_at === "string" ? lead.created_at : null,
@@ -943,6 +952,7 @@ export default function KnockingDoorsPage() {
             linkedJobIds: new Set<string>(),
             hasContingencyEvent: false,
             leadStatusUpdatedAtMs: leadStatusAtMs,
+            knockEventIdSet: new Set<string>(),
           });
           return;
         }
@@ -1060,9 +1070,11 @@ export default function KnockingDoorsPage() {
           linkedJobIds: _linkedJobIds,
           hasContingencyEvent: _hasContingencyEvent,
           leadStatusUpdatedAtMs: _leadStatusUpdatedAtMs,
+          knockEventIdSet: _knockEventIdSet,
           ...rest
         }) => ({
           ...rest,
+          knockEventIds: Array.from(_knockEventIdSet),
           lastKnockedRepName: rest.lastKnockedRepId
             ? nextRepNameById.get(rest.lastKnockedRepId) ?? rest.lastKnockedRepId
             : null,
@@ -1997,6 +2009,74 @@ export default function KnockingDoorsPage() {
     }
   }
 
+  async function deletePinData(pin: DoorPin) {
+    if (!managerView) {
+      setActionError("Only management can delete pins/knocks from this page.");
+      return;
+    }
+
+    const pinKey = normalizeAddress(pin.address);
+    const leadsForAddress = leadsByAddress.get(pinKey) ?? [];
+    const leadCount = leadsForAddress.length;
+    const knockCount = pin.knockEventIds.length;
+
+    const shouldDelete = window.confirm(
+      `Delete this pin and all activity at ${pin.address}?\n\nThis removes ${knockCount} knock event(s) and ${leadCount} lead record(s).`,
+    );
+    if (!shouldDelete) return;
+
+    clearActionFeedback();
+    setDeletingPinKey(pinKey);
+
+    try {
+      const leadIds = leadsForAddress.map((lead) => lead.id);
+      const docs = leadIds.flatMap((leadId) => documentsByLeadId[leadId] ?? []);
+      const docPaths = docs.map((doc) => doc.file_path).filter(Boolean);
+
+      if (pin.knockEventIds.length > 0) {
+        const { error: eventDeleteError } = await supabase
+          .from("knock_events")
+          .delete()
+          .in("id", pin.knockEventIds);
+        if (eventDeleteError) {
+          throw new Error(eventDeleteError.message);
+        }
+      }
+
+      if (docPaths.length > 0) {
+        const { error: storageError } = await supabase.storage
+          .from(LEAD_DOC_BUCKET)
+          .remove(docPaths);
+        if (storageError && !storageError.message.toLowerCase().includes("not found")) {
+          throw new Error(storageError.message);
+        }
+      }
+
+      if (leadIds.length > 0) {
+        const { error: leadDeleteError } = await supabase
+          .from("knock_potential_leads")
+          .delete()
+          .in("id", leadIds);
+        if (leadDeleteError) {
+          throw new Error(leadDeleteError.message);
+        }
+      }
+
+      setActionMessage(
+        `Deleted pin data: ${knockCount} knock(s) and ${leadCount} lead(s) removed.`,
+      );
+      requestRefresh();
+    } catch (removeError) {
+      setActionError(
+        removeError instanceof Error
+          ? removeError.message
+          : "Could not delete this pin and knock data.",
+      );
+    } finally {
+      setDeletingPinKey(null);
+    }
+  }
+
   async function uploadDocument(lead: PotentialLeadRow) {
     const file = selectedFileByLeadId[lead.id] ?? null;
     if (!file) {
@@ -2526,6 +2606,20 @@ export default function KnockingDoorsPage() {
 
                   {expanded ? (
                     <div className="stack" style={{ marginTop: 10 }}>
+                      {managerView ? (
+                        <div className="row">
+                          <button
+                            type="button"
+                            className="secondary"
+                            onClick={() => void deletePinData(pin)}
+                            disabled={deletingPinKey === pinKey}
+                          >
+                            {deletingPinKey === pinKey
+                              ? "Deleting..."
+                              : "Delete Pin/Knocks"}
+                          </button>
+                        </div>
+                      ) : null}
                       <h3 style={{ margin: 0, fontSize: "1rem" }}>
                         Lead Records At This Address
                       </h3>
