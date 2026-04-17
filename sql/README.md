@@ -22,7 +22,9 @@ Run these in order in Supabase SQL editor.
 18. `018_guided_inspection_workflow_v2.sql`
 19. `019_manager_delete_knock_events.sql`
 20. `020_knock_session_inactivity_timeout.sql`
+21. `021_job_geocode_cache.sql`
 
 Notes:
 - Files are idempotent-safe where practical (`if not exists`, policy guards).
 - Migration 016 locks insurance approval to pipeline stage sort order (`approved` threshold), not stage id.
+- Migration 021 adds persisted job geocode cache used by territory heat map.

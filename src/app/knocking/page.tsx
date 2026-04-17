@@ -360,17 +360,56 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, errorMessa
   }
 }
 
-type KnockStageTarget = "lead" | "contingency";
+type KnockStageTarget = "lead" | "inspection_scheduled" | "contingency";
 
-const KNOCK_STAGE_ID_BY_TARGET: Record<KnockStageTarget, number> = {
-  // Locked to your CRM stage table:
-  // 1 = Lead, 2 = Contingency
+const KNOCK_STAGE_NAME_ALIASES: Record<KnockStageTarget, string[]> = {
+  lead: ["lead"],
+  inspection_scheduled: ["inspection scheduled"],
+  contingency: ["contingency"],
+};
+
+const KNOCK_STAGE_FALLBACK_IDS: Partial<Record<KnockStageTarget, number>> = {
   lead: 1,
   contingency: 2,
 };
 
-function resolveStageIdForTarget(target: KnockStageTarget) {
-  return KNOCK_STAGE_ID_BY_TARGET[target];
+function normalizeStageName(value: string | null | undefined) {
+  return (value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function loadKnockStageIds(supabase: any) {
+  const { data, error } = await supabase.from("pipeline_stages").select("id,name");
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  const stageIdByName = new Map<string, number>();
+  ((data ?? []) as Array<{ id?: number | null; name?: string | null }>).forEach((row) => {
+    const id = Number(row.id);
+    const name = normalizeStageName(row.name);
+    if (Number.isFinite(id) && id > 0 && name) {
+      stageIdByName.set(name, id);
+    }
+  });
+
+  const resolved: Partial<Record<KnockStageTarget, number>> = {};
+  (Object.keys(KNOCK_STAGE_NAME_ALIASES) as KnockStageTarget[]).forEach((target) => {
+    const stageId = KNOCK_STAGE_NAME_ALIASES[target]
+      .map((name) => stageIdByName.get(normalizeStageName(name)))
+      .find((id) => typeof id === "number" && Number.isFinite(id));
+
+    if (typeof stageId === "number") {
+      resolved[target] = stageId;
+      return;
+    }
+
+    const fallback = KNOCK_STAGE_FALLBACK_IDS[target];
+    if (typeof fallback === "number") {
+      resolved[target] = fallback;
+    }
+  });
+
+  return resolved;
 }
 
 async function reverseGeocode(lat: number, lng: number, apiKey: string) {
@@ -518,6 +557,7 @@ export default function KnockingPage() {
   const signatureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const signatureDrawingRef = useRef(false);
   const timeoutSweepWarnedRef = useRef(false);
+  const knockStageIdsRef = useRef<Partial<Record<KnockStageTarget, number>> | null>(null);
 
   const geocodeApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
@@ -2077,9 +2117,11 @@ export default function KnockingPage() {
       const shouldMoveToContingency = isInspection && isContingent;
       const stageTarget: KnockStageTarget | null = shouldMoveToContingency
         ? "contingency"
-        : isInspection || isSoftSet
-          ? "lead"
-          : null;
+        : isSoftSet
+          ? "inspection_scheduled"
+          : isInspection
+            ? "lead"
+            : null;
 
       let linkedJobId: string | null = null;
       let linkedTaskId: string | null = null;
@@ -2106,8 +2148,17 @@ export default function KnockingPage() {
 
       if (linkedJobId && stageTarget) {
         try {
-          const stageId = resolveStageIdForTarget(stageTarget);
-          await crmApi.updateJobStage(linkedJobId, stageId, accessToken);
+          if (!knockStageIdsRef.current) {
+            knockStageIdsRef.current = await loadKnockStageIds(supabase);
+          }
+          const stageId = knockStageIdsRef.current[stageTarget] ?? null;
+          if (typeof stageId === "number" && Number.isFinite(stageId)) {
+            await crmApi.updateJobStage(linkedJobId, stageId, accessToken);
+          } else {
+            postSaveWarnings.push(
+              `Job stage update skipped (${stageTarget}): stage id could not be resolved from pipeline_stages.`,
+            );
+          }
         } catch (stageError) {
           postSaveWarnings.push(
             `Job stage update failed (${stageTarget}): ${parseError(

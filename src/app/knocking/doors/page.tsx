@@ -101,6 +101,12 @@ type JobStageRow = {
   stage_id: number | null;
 };
 
+type StageRow = {
+  id: number;
+  name?: string | null;
+  sort_order?: number | null;
+};
+
 type ProfileRow = {
   id: string;
   full_name?: string | null;
@@ -131,7 +137,6 @@ type StatusFilterKey = LeadStatus | "no_lead";
 type RouteStartMode = "pin" | "user_location";
 type MapMode = "pins" | "heatmap";
 
-const CONTINGENCY_STAGE_ID = 2;
 const LEAD_DOC_BUCKET = "knock-potential-lead-documents";
 const HEATMAP_LAYERS: Array<{ value: HeatmapLayer; label: string }> = [
   { value: "conversions", label: "Conversions" },
@@ -251,6 +256,10 @@ function getMarkerInfoWindowContent(pin: DoorPin) {
 
 function normalizeAddress(value: string) {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function normalizeStageName(value: string | null | undefined) {
+  return (value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function toNumber(value: unknown) {
@@ -769,21 +778,28 @@ export default function KnockingDoorsPage() {
       setDataError(null);
       setDataMessage(null);
 
+      const eventsQuery = supabase
+        .from("knock_events")
+        .select(
+          "id,rep_id,address,latitude,longitude,created_at,outcome,homeowner_name,contingencies_delta,linked_job_id",
+        )
+        .not("address", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(5000);
+      const leadsQuery = supabase
+        .from("knock_potential_leads")
+        .select(POTENTIAL_LEAD_SELECT)
+        .not("address", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(5000);
+      if (!managerView) {
+        eventsQuery.eq("rep_id", user.id);
+        leadsQuery.eq("rep_id", user.id);
+      }
+
       const [eventsResult, initialLeadsResult] = await Promise.all([
-        supabase
-          .from("knock_events")
-          .select(
-            "id,rep_id,address,latitude,longitude,created_at,outcome,homeowner_name,contingencies_delta,linked_job_id",
-          )
-          .not("address", "is", null)
-          .order("created_at", { ascending: false })
-          .limit(5000),
-        supabase
-          .from("knock_potential_leads")
-          .select(POTENTIAL_LEAD_SELECT)
-          .not("address", "is", null)
-          .order("created_at", { ascending: false })
-          .limit(5000),
+        eventsQuery,
+        leadsQuery,
       ]);
 
       let leadsResult: any = initialLeadsResult;
@@ -806,7 +822,7 @@ export default function KnockingDoorsPage() {
         leadsResult.error.message.toLowerCase().includes("column") &&
         leadsResult.error.message.toLowerCase().includes("does not exist")
       ) {
-        const fallbackLeadsResult = await supabase
+        const fallbackLeadsQuery = supabase
           .from("knock_potential_leads")
           .select(
             "id,rep_id,address,address_normalized,latitude,longitude,created_at,updated_at,homeowner_name,notes",
@@ -814,6 +830,10 @@ export default function KnockingDoorsPage() {
           .not("address", "is", null)
           .order("created_at", { ascending: false })
           .limit(5000);
+        if (!managerView) {
+          fallbackLeadsQuery.eq("rep_id", user.id);
+        }
+        const fallbackLeadsResult = await fallbackLeadsQuery;
 
         if (!active) return;
 
@@ -996,7 +1016,10 @@ export default function KnockingDoorsPage() {
         }
       });
 
-      let contingencyJobIds = new Set<string>();
+      let contingencySortOrder: number | null = null;
+      let contingencyStageId: number | null = null;
+      const stageSortById = new Map<number, number>();
+      const stageIdByJobId = new Map<string, number>();
       const allLinkedJobIds = Array.from(
         new Set(
           Array.from(grouped.values()).flatMap((item) =>
@@ -1007,6 +1030,25 @@ export default function KnockingDoorsPage() {
 
       if (allLinkedJobIds.length > 0) {
         try {
+          const { data: stagesData, error: stagesError } = await supabase
+            .from("pipeline_stages")
+            .select("id,name,sort_order");
+          if (stagesError) {
+            throw stagesError;
+          }
+          ((stagesData ?? []) as StageRow[]).forEach((row) => {
+            const id = Number(row.id);
+            const sortOrder = Number(row.sort_order);
+            if (Number.isFinite(id) && id > 0 && Number.isFinite(sortOrder)) {
+              stageSortById.set(id, sortOrder);
+            }
+            if (normalizeStageName(row.name) === "contingency") {
+              contingencyStageId = Number.isFinite(id) && id > 0 ? id : null;
+              contingencySortOrder =
+                Number.isFinite(sortOrder) && sortOrder > 0 ? sortOrder : null;
+            }
+          });
+
           const rows: JobStageRow[] = [];
           for (const idsChunk of chunkArray(allLinkedJobIds, 200)) {
             const { data: jobsData, error: jobsError } = await supabase
@@ -1018,14 +1060,15 @@ export default function KnockingDoorsPage() {
               throw jobsError;
             }
 
-            rows.push(...((jobsData ?? []) as JobStageRow[]));
+            const chunkRows = (jobsData ?? []) as JobStageRow[];
+            rows.push(...chunkRows);
+            chunkRows.forEach((row) => {
+              const stageId = Number(row.stage_id);
+              if (row.id && Number.isFinite(stageId) && stageId > 0) {
+                stageIdByJobId.set(row.id, stageId);
+              }
+            });
           }
-
-          contingencyJobIds = new Set(
-            rows
-              .filter((row) => Number(row.stage_id) === CONTINGENCY_STAGE_ID)
-              .map((row) => row.id),
-          );
         } catch (jobsLookupError) {
           console.warn(
             "Knocked doors map: could not apply job-stage contingency filter.",
@@ -1037,7 +1080,20 @@ export default function KnockingDoorsPage() {
       const filtered = Array.from(grouped.values()).filter((item) => {
         if (item.hasContingencyEvent) return false;
         for (const linkedJobId of item.linkedJobIds) {
-          if (contingencyJobIds.has(linkedJobId)) return false;
+          const stageId = stageIdByJobId.get(linkedJobId);
+          if (typeof stageId !== "number") continue;
+          if (typeof contingencyStageId === "number" && stageId === contingencyStageId) {
+            return false;
+          }
+          if (typeof contingencySortOrder === "number") {
+            const stageSortOrder = stageSortById.get(stageId);
+            if (
+              typeof stageSortOrder === "number" &&
+              stageSortOrder >= contingencySortOrder
+            ) {
+              return false;
+            }
+          }
         }
         return true;
       });
