@@ -120,6 +120,13 @@ type RouteSummary = {
   totalDurationMinutes: number;
 };
 
+type RouteLaunchSegment = {
+  id: string;
+  label: string;
+  stopCount: number;
+  url: string;
+};
+
 type StatusFilterKey = LeadStatus | "no_lead";
 type RouteStartMode = "pin" | "user_location";
 type MapMode = "pins" | "heatmap";
@@ -581,6 +588,12 @@ export default function KnockingDoorsPage() {
   const [selectedRoutePinKeys, setSelectedRoutePinKeys] = useState<string[]>([]);
   const [routeSummary, setRouteSummary] = useState<RouteSummary | null>(null);
   const [routeLaunchUrl, setRouteLaunchUrl] = useState<string | null>(null);
+  const [routeLaunchSegments, setRouteLaunchSegments] = useState<
+    RouteLaunchSegment[]
+  >([]);
+  const [completedRouteLaunchIds, setCompletedRouteLaunchIds] = useState<
+    string[]
+  >([]);
   const [buildingRoute, setBuildingRoute] = useState(false);
   const [routeStartPromptOpen, setRouteStartPromptOpen] = useState(false);
   const [routeStartMode, setRouteStartMode] = useState<RouteStartMode>("pin");
@@ -597,7 +610,7 @@ export default function KnockingDoorsPage() {
   const drawingManagerRef = useRef<any>(null);
   const routeCircleRef = useRef<any>(null);
   const routeCircleListenersRef = useRef<any[]>([]);
-  const directionsRendererRef = useRef<any>(null);
+  const directionsRenderersRef = useRef<any[]>([]);
   const geocodeCacheRef = useRef<
     Map<string, { lat: number; lng: number } | null>
   >(new Map());
@@ -1270,10 +1283,8 @@ export default function KnockingDoorsPage() {
         drawingManagerRef.current.setMap(null);
         drawingManagerRef.current = null;
       }
-      if (directionsRendererRef.current) {
-        directionsRendererRef.current.setMap(null);
-        directionsRendererRef.current = null;
-      }
+      directionsRenderersRef.current.forEach((renderer) => renderer?.setMap?.(null));
+      directionsRenderersRef.current = [];
       markersRef.current.forEach((marker) => marker.setMap(null));
       markersRef.current.clear();
       heatmapCirclesRef.current.forEach((circle) => circle.setMap(null));
@@ -1479,7 +1490,7 @@ export default function KnockingDoorsPage() {
 
   useEffect(() => {
     if (selectedRoutePins.length >= 2) return;
-    if (!directionsRendererRef.current && !routeSummary) return;
+    if (directionsRenderersRef.current.length === 0 && !routeSummary) return;
     clearRenderedRoute();
   }, [routeSummary, selectedRoutePins.length]);
 
@@ -1562,12 +1573,20 @@ export default function KnockingDoorsPage() {
   }
 
   function clearRenderedRoute() {
-    if (directionsRendererRef.current) {
-      directionsRendererRef.current.setMap(null);
-      directionsRendererRef.current = null;
-    }
+    directionsRenderersRef.current.forEach((renderer) => renderer?.setMap?.(null));
+    directionsRenderersRef.current = [];
     setRouteSummary(null);
     setRouteLaunchUrl(null);
+    setRouteLaunchSegments([]);
+    setCompletedRouteLaunchIds([]);
+  }
+
+  function toggleRouteLaunchCompleted(segmentId: string) {
+    setCompletedRouteLaunchIds((previous) =>
+      previous.includes(segmentId)
+        ? previous.filter((id) => id !== segmentId)
+        : [...previous, segmentId],
+    );
   }
 
   function startRouteCircleDraw() {
@@ -1678,27 +1697,29 @@ export default function KnockingDoorsPage() {
     setBuildingRoute(true);
 
     try {
-      const maxStops = 24;
-      const routeStops = selected.slice(0, maxStops);
-      if (selected.length > maxStops) {
-        setActionMessage(
-          `Selected ${selected.length} leads. Routing the first ${maxStops} due to Google waypoint limits.`,
+      clearRenderedRoute();
+      const routeNotices: string[] = [];
+      const maxOptimizedStopsPerRequest = 24;
+      if (selected.length > maxOptimizedStopsPerRequest) {
+        routeNotices.push(
+          `Selected ${selected.length} leads. Building multiple optimized route chunks of up to ${maxOptimizedStopsPerRequest} pins.`,
         );
       }
 
       let origin: { lat: number; lng: number };
+      let requestedStartPin: DoorPin | null = null;
       let startPinAddressKey = "";
 
       if (startMode === "user_location") {
         const userLocation = await getBrowserGeolocation();
         origin = userLocation;
       } else {
-        const requestedStartPin =
+        requestedStartPin =
           (startPinKey
-            ? routeStops.find(
+            ? selected.find(
                 (pin) => normalizeAddress(pin.address) === startPinKey,
               )
-            : null) ?? routeStops[0];
+            : null) ?? selected[0];
 
         origin = {
           lat: requestedStartPin.lat as number,
@@ -1707,127 +1728,220 @@ export default function KnockingDoorsPage() {
         startPinAddressKey = normalizeAddress(requestedStartPin.address);
       }
 
-      const endpointCandidates = routeStops.filter((pin) => {
-        if (startMode === "pin" && routeStops.length > 1) {
-          return normalizeAddress(pin.address) !== startPinAddressKey;
-        }
-        return true;
-      });
-
-      if (endpointCandidates.length === 0) {
-        setActionError("Could not determine endpoint candidates for this route.");
-        return;
+      const directionsService = new maps.DirectionsService();
+      const pinsToOptimize =
+        startMode === "pin"
+          ? selected.filter(
+              (pin) => normalizeAddress(pin.address) !== startPinAddressKey,
+            )
+          : selected;
+      let remainingStops = [...pinsToOptimize];
+      if (remainingStops.length === 0) {
+        throw new Error("Could not determine stops for this route.");
       }
 
-      const directionsService = new maps.DirectionsService();
-      let bestResult: any = null;
-      let bestWaypoints: Array<{
-        location: { lat: number; lng: number };
-        stopover: true;
-      }> = [];
-      let bestDestination: { lat: number; lng: number } | null = null;
-      let bestDurationSeconds = Number.POSITIVE_INFINITY;
+      let chunkOrigin = origin;
+      const orderedSelectedPinLocations: string[] = [];
+      if (startMode === "pin" && requestedStartPin) {
+        orderedSelectedPinLocations.push(
+          formatLatLng(requestedStartPin.lat as number, requestedStartPin.lng as number),
+        );
+      }
+      const chunkRouteResults: any[] = [];
+      let totalDistanceMeters = 0;
+      let totalDurationSeconds = 0;
+      let chunkCount = 0;
 
-      for (const endpoint of endpointCandidates) {
-        const endpointAddressKey = normalizeAddress(endpoint.address);
-        const destination = {
-          lat: endpoint.lat as number,
-          lng: endpoint.lng as number,
-        };
+      // Greedy cross-chunk ordering: each chunk starts with the nearest remaining pins
+      // from the current chunk origin, then Google optimizes waypoint order in that chunk.
+      while (remainingStops.length > 0) {
+        const chunkStops = [...remainingStops]
+          .sort((a, b) => {
+            const da = distanceMetersBetween(
+              chunkOrigin.lat,
+              chunkOrigin.lng,
+              a.lat as number,
+              a.lng as number,
+            );
+            const db = distanceMetersBetween(
+              chunkOrigin.lat,
+              chunkOrigin.lng,
+              b.lat as number,
+              b.lng as number,
+            );
+            return da - db;
+          })
+          .slice(0, maxOptimizedStopsPerRequest);
+        chunkCount += 1;
 
-        const intermediateStops = routeStops.filter((pin) => {
-          const key = normalizeAddress(pin.address);
-          if (key === endpointAddressKey) return false;
-          if (startMode === "pin" && routeStops.length > 1 && key === startPinAddressKey) {
-            return false;
+        let bestResult: any = null;
+        let bestWaypoints: Array<{
+          location: { lat: number; lng: number };
+          stopover: true;
+        }> = [];
+        let bestDestination: { lat: number; lng: number } | null = null;
+        let bestDurationSecondsForChunk = Number.POSITIVE_INFINITY;
+
+        for (const endpoint of chunkStops) {
+          const endpointAddressKey = normalizeAddress(endpoint.address);
+          const destination = {
+            lat: endpoint.lat as number,
+            lng: endpoint.lng as number,
+          };
+
+          const intermediateStops = chunkStops.filter((pin) => {
+            const key = normalizeAddress(pin.address);
+            return key !== endpointAddressKey;
+          });
+
+          const waypoints = intermediateStops.map((pin) => ({
+            location: { lat: pin.lat as number, lng: pin.lng as number },
+            stopover: true as const,
+          }));
+
+          const routeResult = await directionsService.route({
+            origin: chunkOrigin,
+            destination,
+            waypoints,
+            optimizeWaypoints: true,
+            travelMode: maps.TravelMode.DRIVING,
+          });
+
+          const legs = routeResult.routes?.[0]?.legs ?? [];
+          const durationSeconds = legs.reduce(
+            (sum: number, leg: any) => sum + Number(leg?.duration?.value ?? 0),
+            0,
+          );
+
+          if (durationSeconds < bestDurationSecondsForChunk) {
+            bestDurationSecondsForChunk = durationSeconds;
+            bestResult = routeResult;
+            bestWaypoints = waypoints;
+            bestDestination = destination;
           }
-          return true;
+        }
+
+        if (!bestResult || !bestDestination) {
+          throw new Error("Could not generate optimized route.");
+        }
+        chunkRouteResults.push(bestResult);
+
+        const optimizedWaypointOrder: number[] =
+          bestResult.routes?.[0]?.waypoint_order ?? [];
+        const orderedWaypointLocations = optimizedWaypointOrder.map((index) => {
+          const point = bestWaypoints[index]?.location;
+          return formatLatLng(point.lat, point.lng);
         });
-
-        const waypoints = intermediateStops.map((pin) => ({
-          location: { lat: pin.lat as number, lng: pin.lng as number },
-          stopover: true as const,
-        }));
-
-        const routeResult = await directionsService.route({
-          origin,
-          destination,
-          waypoints,
-          optimizeWaypoints: true,
-          travelMode: maps.TravelMode.DRIVING,
-        });
-
-        const legs = routeResult.routes?.[0]?.legs ?? [];
-        const durationSeconds = legs.reduce(
-          (sum: number, leg: any) => sum + Number(leg?.duration?.value ?? 0),
-          0,
+        orderedSelectedPinLocations.push(
+          ...orderedWaypointLocations,
+          formatLatLng(bestDestination.lat, bestDestination.lng),
         );
 
-        if (durationSeconds < bestDurationSeconds) {
-          bestDurationSeconds = durationSeconds;
-          bestResult = routeResult;
-          bestWaypoints = waypoints;
-          bestDestination = destination;
-        }
+        const legs = bestResult.routes?.[0]?.legs ?? [];
+        totalDistanceMeters += legs.reduce(
+          (sum: number, leg: any) => sum + Number(leg?.distance?.value ?? 0),
+          0,
+        );
+        totalDurationSeconds += bestDurationSecondsForChunk;
+        chunkOrigin = bestDestination;
+
+        const chunkStopKeys = new Set(
+          chunkStops.map((pin) => normalizeAddress(pin.address)),
+        );
+        remainingStops = remainingStops.filter(
+          (pin) => !chunkStopKeys.has(normalizeAddress(pin.address)),
+        );
       }
 
-      if (!bestResult || !bestDestination) {
+      if (chunkRouteResults.length === 0) {
         throw new Error("Could not generate optimized route.");
       }
 
-      if (!directionsRendererRef.current) {
-        directionsRendererRef.current = new maps.DirectionsRenderer({
-          preserveViewport: false,
-          suppressMarkers: false,
+      directionsRenderersRef.current = chunkRouteResults.map((chunkResult, index) => {
+        const renderer = new maps.DirectionsRenderer({
+          preserveViewport: true,
+          suppressMarkers: index > 0,
           polylineOptions: {
             strokeColor: "#1d4ed8",
             strokeWeight: 5,
             strokeOpacity: 0.82,
           },
         });
-      }
-
-      directionsRendererRef.current.setMap(mapRef.current);
-      directionsRendererRef.current.setDirections(bestResult);
-
-      const optimizedWaypointOrder: number[] =
-        bestResult.routes?.[0]?.waypoint_order ?? [];
-      const orderedWaypointLocations = optimizedWaypointOrder.map((index) => {
-        const point = bestWaypoints[index]?.location;
-        return formatLatLng(point.lat, point.lng);
+        renderer.setMap(mapRef.current);
+        renderer.setDirections(chunkResult);
+        return renderer;
       });
 
-      const mobileWaypointLimit = 9;
-      const waypointLocationsForLaunch = orderedWaypointLocations.slice(
-        0,
-        mobileWaypointLimit,
+      const bounds = new maps.LatLngBounds();
+      if (startMode === "user_location") {
+        bounds.extend(origin);
+      }
+      selected.forEach((pin) => {
+        bounds.extend({ lat: pin.lat as number, lng: pin.lng as number });
+      });
+      mapRef.current.fitBounds(bounds);
+
+      routeNotices.push(
+        `Optimized in ${chunkCount} sequential chunk(s) for turn-by-turn efficiency across all selected pins.`,
+      );
+      const maxMapsDestinations = 10;
+      const pinChunks = chunkArray(orderedSelectedPinLocations, maxMapsDestinations);
+
+      const mapsLaunchSegments: RouteLaunchSegment[] = pinChunks
+        .map((chunk, index) => {
+          const previousChunkLastLocation =
+            index > 0 ? pinChunks[index - 1]?.[pinChunks[index - 1].length - 1] : null;
+
+          const originLocation =
+            index === 0
+              ? startMode === "user_location"
+                ? "Current Location"
+                : chunk[0]
+              : previousChunkLastLocation ?? chunk[0];
+
+          const destinationsForSegment =
+            index === 0 && startMode === "pin" ? chunk.slice(1) : chunk;
+
+          if (destinationsForSegment.length === 0) {
+            return null;
+          }
+
+          const destinationLocation =
+            destinationsForSegment[destinationsForSegment.length - 1];
+          const waypointLocations = destinationsForSegment.slice(
+            0,
+            destinationsForSegment.length - 1,
+          );
+
+          return {
+            id: `route-segment-${index + 1}`,
+            label: `Route ${index + 1}`,
+            stopCount: chunk.length,
+            url: buildGoogleMapsDirectionsUrl({
+              origin: originLocation,
+              destination: destinationLocation,
+              waypointLocations,
+            }),
+          };
+        })
+        .filter((segment): segment is RouteLaunchSegment => segment !== null);
+
+      setRouteLaunchSegments(mapsLaunchSegments);
+      setCompletedRouteLaunchIds([]);
+      setRouteLaunchUrl(
+        mapsLaunchSegments.length === 1 ? mapsLaunchSegments[0].url : null,
       );
 
-      if (orderedWaypointLocations.length > mobileWaypointLimit) {
-        setActionMessage(
-          `Route opened with first ${mobileWaypointLimit} waypoints for app compatibility.`,
+      if (selected.length > maxMapsDestinations) {
+        routeNotices.push(
+          `Split into ${mapsLaunchSegments.length} routes (up to ${maxMapsDestinations} pins each) for Maps app launch limits.`,
         );
       }
-
-      const mapsLaunchUrl = buildGoogleMapsDirectionsUrl({
-        origin:
-          startMode === "user_location"
-            ? "Current Location"
-            : formatLatLng(origin.lat, origin.lng),
-        destination: formatLatLng(bestDestination.lat, bestDestination.lng),
-        waypointLocations: waypointLocationsForLaunch,
-      });
-      setRouteLaunchUrl(mapsLaunchUrl);
-
-      const legs = bestResult.routes?.[0]?.legs ?? [];
-      const totalDistanceMeters = legs.reduce(
-        (sum: number, leg: any) => sum + Number(leg?.distance?.value ?? 0),
-        0,
-      );
+      setActionMessage(routeNotices.length > 0 ? routeNotices.join(" ") : null);
       setRouteSummary({
-        stopCount: routeStops.length,
+        stopCount: selected.length,
         totalDistanceMiles: totalDistanceMeters / 1609.344,
-        totalDurationMinutes: bestDurationSeconds / 60,
+        totalDurationMinutes: totalDurationSeconds / 60,
       });
     } catch (routeError) {
       setActionError(
@@ -1851,6 +1965,10 @@ export default function KnockingDoorsPage() {
       return;
     }
     window.location.assign(routeLaunchUrl);
+  }
+
+  function openRouteSegmentInMapsApp(url: string) {
+    window.location.assign(url);
   }
 
   async function saveLead(lead: PotentialLeadRow) {
@@ -2384,20 +2502,59 @@ export default function KnockingDoorsPage() {
           </p>
         ) : null}
         {routeSummary ? (
-          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+          <div className="stack" style={{ gap: 8 }}>
             <p className="hint" style={{ margin: 0 }}>
               Optimized route for {routeSummary.stopCount} stops | Distance:{" "}
               {formatMiles(routeSummary.totalDistanceMiles)} | ETA:{" "}
               {formatMinutes(routeSummary.totalDurationMinutes)}
             </p>
-            <button
-              type="button"
-              className="secondary"
-              onClick={openRouteInMapsApp}
-              disabled={!routeLaunchUrl || buildingRoute}
-            >
-              Open In Maps App
-            </button>
+            {routeLaunchSegments.length <= 1 ? (
+              <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={openRouteInMapsApp}
+                  disabled={!routeLaunchUrl || buildingRoute}
+                >
+                  Open In Maps App
+                </button>
+              </div>
+            ) : (
+              <div className="stack" style={{ gap: 6 }}>
+                <p className="hint" style={{ margin: 0 }}>
+                  Split routes (open in order):
+                </p>
+                {routeLaunchSegments.map((segment) => (
+                  <div
+                    key={segment.id}
+                    className="row"
+                    style={{ gap: 10, alignItems: "center", flexWrap: "wrap" }}
+                  >
+                    <label
+                      className="row"
+                      style={{ gap: 6, alignItems: "center", margin: 0 }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={completedRouteLaunchIds.includes(segment.id)}
+                        onChange={() => toggleRouteLaunchCompleted(segment.id)}
+                      />
+                      <span className="hint" style={{ margin: 0 }}>
+                        {segment.label} ({segment.stopCount} pins)
+                      </span>
+                    </label>
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() => openRouteSegmentInMapsApp(segment.url)}
+                      disabled={buildingRoute}
+                    >
+                      Open In Maps App
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ) : null}
         {routeStartPromptOpen ? (
