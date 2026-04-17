@@ -1,4 +1,4 @@
--- 4E Field: auto-end stale knock sessions after inactivity.
+-- 4E Field: auto-pause stale knock sessions after inactivity.
 
 create or replace function public.timeout_stale_knock_sessions(inactivity_minutes integer default 30)
 returns integer
@@ -15,21 +15,11 @@ begin
 
   update public.knock_sessions s
   set
-    status = 'ended',
-    ended_at = now(),
-    paused_at = null,
-    session_seconds = greatest(
-      0,
-      floor(extract(epoch from (now() - s.started_at)))::integer
-      - coalesce(s.total_paused_seconds, 0)
-      - case
-          when s.status = 'paused' and s.paused_at is not null
-            then greatest(0, floor(extract(epoch from (now() - s.paused_at)))::integer)
-          else 0
-        end
-    ),
+    status = 'paused',
+    paused_at = coalesce(s.paused_at, now()),
+    ended_at = null,
     updated_at = now()
-  where s.status in ('active', 'paused')
+  where s.status = 'active'
     and s.ended_at is null
     and coalesce(s.last_heartbeat_at, s.started_at) <= now() - make_interval(mins => inactivity_minutes);
 
