@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { AppShell } from "@/components/AppShell";
+import { StatusPill } from "@/components/StatusPill";
 import { formatDate, jobSubtitle, jobTitle } from "@/lib/format";
 import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 import { useAuthSession } from "@/lib/use-auth-session";
@@ -38,6 +39,28 @@ type Homeowner = JsonRecord & {
   zip?: string | null;
 };
 
+type JobRep = JsonRecord & {
+  profile_id?: string | null;
+  profiles?:
+    | (JsonRecord & {
+        id?: string | null;
+        full_name?: string | null;
+      })
+    | Array<
+        JsonRecord & {
+          id?: string | null;
+          full_name?: string | null;
+        }
+      >
+    | null;
+};
+
+type PipelineStage = JsonRecord & {
+  id?: number | null;
+  name?: string | null;
+  sort_order?: number | null;
+};
+
 function asText(value: unknown) {
   if (typeof value !== "string") return "";
   const trimmed = value.trim();
@@ -51,6 +74,22 @@ function getHomeowner(job: JobRecord | null): Homeowner | null {
   return Array.isArray(related) ? related[0] ?? null : related;
 }
 
+function getAssignedRepNames(job: JobRecord | null) {
+  if (!job) return [];
+  const related = job.job_reps as JobRep[] | null | undefined;
+  if (!related || related.length === 0) return [];
+
+  const names = related
+    .map((entry) => {
+      const profiles = entry.profiles;
+      const profile = Array.isArray(profiles) ? profiles[0] ?? null : profiles;
+      return asText(profile?.full_name ?? null);
+    })
+    .filter(Boolean);
+
+  return Array.from(new Set(names));
+}
+
 function buildHomeownerAddress(job: JobRecord | null, homeowner: Homeowner | null) {
   const street = asText(homeowner?.address ?? null) || asText(job?.property_address);
   const city = asText(homeowner?.city ?? null) || asText(job?.city);
@@ -59,6 +98,46 @@ function buildHomeownerAddress(job: JobRecord | null, homeowner: Homeowner | nul
   const cityStateZip = [city, state, zip].filter(Boolean).join(" ");
   const full = [street, cityStateZip].filter(Boolean).join(", ");
   return full || "No address available";
+}
+
+function getJobStatusValue(job: JobRecord | null) {
+  if (!job) return "Unknown";
+  const relatedStage = job.pipeline_stages as
+    | PipelineStage
+    | PipelineStage[]
+    | null
+    | undefined;
+  const stage = Array.isArray(relatedStage) ? relatedStage[0] ?? null : relatedStage;
+  return (
+    asText(stage?.name ?? null) ||
+    asText(job.stage_name) ||
+    asText(job.status) ||
+    asText(job.job_status) ||
+    asText(job.pipeline_stage_name) ||
+    "Unknown"
+  );
+}
+
+function toNumber(value: unknown) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatMoney(value: unknown) {
+  const amount = toNumber(value);
+  if (amount === null) return "-";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+  }).format(amount);
+}
+
+function formatOverviewDate(value: unknown) {
+  const text = asText(value);
+  if (!text) return "-";
+  const parsed = new Date(text);
+  if (Number.isNaN(parsed.getTime())) return text;
+  return parsed.toLocaleDateString();
 }
 
 function normalizeMentionSyntax(text: string) {
@@ -147,7 +226,19 @@ export default function JobDetailPage() {
         .select(
           `
           *,
-          homeowners (*)
+          pipeline_stages (
+            id,
+            name,
+            sort_order
+          ),
+          homeowners (*),
+          job_reps (
+            profile_id,
+            profiles (
+              id,
+              full_name
+            )
+          )
         `,
         )
         .eq("id", jobId)
@@ -376,6 +467,8 @@ export default function JobDetailPage() {
   const homeownerPhone = asText(homeowner?.phone ?? null);
   const homeownerEmail = asText(homeowner?.email ?? null);
   const homeownerAddress = buildHomeownerAddress(job, homeowner);
+  const assignedRepNames = getAssignedRepNames(job);
+  const jobStatus = getJobStatusValue(job);
   const displayTitle = homeownerName || (job ? jobTitle(job) : `Job ${jobId.slice(0, 8)}`);
 
   return (
@@ -403,25 +496,212 @@ export default function JobDetailPage() {
       </section>
 
       <section className="panel">
-        <h3>Homeowner Info</h3>
-        <div className="stack">
-          <p className="muted">
-            Name: {homeownerName || "No homeowner name on this job"}
-          </p>
-          <p className="muted">
-            Phone:{" "}
-            {homeownerPhone ? <a href={`tel:${homeownerPhone}`}>{homeownerPhone}</a> : "No phone"}
-          </p>
-          <p className="muted">
-            Email:{" "}
-            {homeownerEmail ? <a href={`mailto:${homeownerEmail}`}>{homeownerEmail}</a> : "No email"}
-          </p>
-          <p className="muted">Address: {homeownerAddress}</p>
+        <div className="row" style={{ alignItems: "flex-start", gap: 12 }}>
+          <div>
+            <p
+              className="hint"
+              style={{
+                margin: 0,
+                textTransform: "uppercase",
+                letterSpacing: "0.12em",
+                color: "var(--brand)",
+                fontWeight: 700,
+                fontSize: "0.74rem",
+              }}
+            >
+              Overview
+            </p>
+            <h3 style={{ margin: "4px 0 0 0" }}>Homeowner, claim, and production snapshot</h3>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <span className="hint" style={{ margin: 0 }}>
+              Status
+            </span>
+            <StatusPill value={jobStatus} />
+          </div>
+        </div>
+        <div
+          className="grid"
+          style={{
+            marginTop: 12,
+            gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+          }}
+        >
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Homeowner
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {homeownerName || "No homeowner name on this job"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Phone
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {homeownerPhone ? <a href={`tel:${homeownerPhone}`}>{homeownerPhone}</a> : "No phone"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Email
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {homeownerEmail ? <a href={`mailto:${homeownerEmail}`}>{homeownerEmail}</a> : "No email"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Address
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>{homeownerAddress}</p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Claim Number
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.claim_number) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Insurance Carrier
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.insurance_carrier) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Assigned Team
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {assignedRepNames.length > 0 ? assignedRepNames.join(", ") : "No one assigned"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Deductible
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>{formatMoney(job?.deductible)}</p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Adjuster Name
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.adjuster_name) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Adjuster Phone
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.adjuster_phone) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Adjuster Email
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.adjuster_email) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Type of Loss
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.type_of_loss) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Date of Loss
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {formatOverviewDate(job?.date_of_loss)}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Install Date
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {formatOverviewDate(job?.install_date)}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Contract Signed
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {formatOverviewDate(job?.contract_signed_date)}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Shingle Name
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.shingle_name) || "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Contract Amount
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>{formatMoney(job?.contract_amount)}</p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Supplemented Amount
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {formatMoney(job?.supplemented_amount)}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Deposit Collected
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {formatMoney(job?.deposit_collected)}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Remaining Balance
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {formatMoney(job?.remaining_balance)}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Created
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.created_at) ? formatDate(String(job?.created_at)) : "-"}
+            </p>
+          </article>
+          <article className="job-card">
+            <p className="hint" style={{ marginTop: 0 }}>
+              Last Updated
+            </p>
+            <p className="muted" style={{ marginBottom: 0 }}>
+              {asText(job?.updated_at) ? formatDate(String(job?.updated_at)) : "-"}
+            </p>
+          </article>
         </div>
       </section>
 
       <section className="panel">
-        <h3>Create Note</h3>
+        <h3>Notes</h3>
         <form onSubmit={submitNote} className="stack">
           <div className="mention-wrap">
             <textarea
@@ -505,6 +785,15 @@ export default function JobDetailPage() {
           </div>
           <p className="hint">Use `@First Last` or `@first.last` to notify that user in CRM.</p>
         </form>
+        <div className="grid" style={{ marginTop: 10 }}>
+          {notes.map((note) => (
+            <article key={note.id} className="job-card">
+              <p style={{ marginTop: 0 }}>{String(note.content ?? note.body ?? note.note ?? "Note")}</p>
+              <p className="hint">{formatDate(note.created_at)}</p>
+            </article>
+          ))}
+          {notes.length === 0 ? <p className="hint">No notes found.</p> : null}
+        </div>
       </section>
 
       <section className="panel">
@@ -521,19 +810,6 @@ export default function JobDetailPage() {
             </button>
             <span className="hint">Write path: CRM `/api/jobs/[jobId]/uploads`</span>
           </div>
-        </div>
-      </section>
-
-      <section className="panel">
-        <h3>Recent Notes</h3>
-        <div className="grid">
-          {notes.map((note) => (
-            <article key={note.id} className="job-card">
-              <p style={{ marginTop: 0 }}>{String(note.content ?? note.body ?? note.note ?? "Note")}</p>
-              <p className="hint">{formatDate(note.created_at)}</p>
-            </article>
-          ))}
-          {notes.length === 0 ? <p className="hint">No notes found.</p> : null}
         </div>
       </section>
 
