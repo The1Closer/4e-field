@@ -513,6 +513,10 @@ button.danger:hover {
 .menu-btn {
   width: 42px;
   height: 42px;
+  border-radius: 12px;
+  border-color: var(--border-strong) !important;
+  background: linear-gradient(135deg, var(--panel-soft-hover), var(--panel-soft)) !important;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
 }
 
 .menu-icon {
@@ -521,10 +525,10 @@ button.danger:hover {
 }
 
 .menu-icon span {
-  width: 16px;
-  height: 2px;
+  width: 17px;
+  height: 2.2px;
   border-radius: 99px;
-  background: currentColor;
+  background: var(--ink);
   display: block;
 }
 
@@ -801,22 +805,68 @@ button.danger:hover {
 .shell-drawer-inner {
   height: 100%;
   overflow-y: auto;
-  padding: 16px;
+  padding: 14px;
   display: grid;
-  gap: 12px;
+  gap: 14px;
+}
+
+.shell-drawer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 2px 2px;
+}
+
+.shell-drawer-title-wrap {
+  display: grid;
+  gap: 3px;
+}
+
+.shell-drawer-eyebrow {
+  margin: 0;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.shell-drawer-title {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.shell-drawer-subtitle {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.86rem;
+}
+
+.shell-drawer-close {
+  border-radius: 12px;
+}
+
+.shell-drawer-close span {
+  font-size: 1.4rem;
+  line-height: 1;
 }
 
 .shell-drawer-nav {
   display: grid;
-  gap: 8px;
+  gap: 10px;
 }
 
 .drawer-link {
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 14px;
   background: var(--panel-soft);
-  color: var(--ink-soft);
-  padding: 10px 12px;
+  color: var(--ink);
+  padding: 12px 13px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   transition: border-color 180ms ease, background-color 180ms ease, color 180ms ease;
 }
 
@@ -826,10 +876,19 @@ button.danger:hover {
   color: var(--ink);
 }
 
+.drawer-link-chevron {
+  color: var(--ink-faint);
+  font-size: 1.08rem;
+}
+
 .drawer-link-active {
   background: var(--brand);
   color: #111;
   border-color: rgba(214, 179, 122, 0.8);
+}
+
+.drawer-link-active .drawer-link-chevron {
+  color: #111;
 }
 
 .shell-overlay {
@@ -938,6 +997,10 @@ button.danger:hover {
     padding: 0 18px;
   }
 
+  .content {
+    gap: 18px;
+  }
+
   .shell-brand {
     gap: 14px;
   }
@@ -993,12 +1056,60 @@ button.danger:hover {
     padding-top: 18px;
     padding-bottom: 40px;
   }
+
+  .lead-list-table thead th {
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+    z-index: 1;
+  }
+}
+
+@media (min-width: 768px) and (max-width: 1199px) {
+  .layout {
+    max-width: 1120px;
+    padding: 0 20px;
+  }
+
+  .panel {
+    padding: 20px;
+    border-radius: 18px;
+  }
+
+  .live-map {
+    height: 56dvh;
+    min-height: 360px;
+  }
+
+  .knock-screen {
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 16px;
+    gap: 14px;
+  }
+
+  .knock-header {
+    padding: 14px;
+    border-radius: 16px;
+  }
+
+  .knock-card {
+    padding: 14px;
+  }
+
+  .knock-events-list {
+    max-height: 46dvh;
+  }
 }
 
 @media (min-width: 1200px) {
   .layout {
     max-width: 1280px;
     padding: 0 20px;
+  }
+
+  .content {
+    gap: 22px;
   }
 
   .shell-header-inner {
@@ -1023,6 +1134,28 @@ button.danger:hover {
   }
 
   .panel {
-    padding: 20px;
+    padding: 22px;
+  }
+
+  .live-map {
+    height: 60dvh;
+    min-height: 420px;
+  }
+
+  .knock-screen {
+    max-width: 1320px;
+    margin: 0 auto;
+    padding: 18px;
+    gap: 16px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .knock-screen > .knock-header {
+    grid-column: 1 / -1;
+  }
+
+  .knock-events-list {
+    max-height: 52dvh;
   }
 }

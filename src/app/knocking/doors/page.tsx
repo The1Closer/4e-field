@@ -96,6 +96,31 @@ type DoorPin = {
   repCount: number;
 };
 
+type PagedDoorPinRow = JsonRecord & {
+  address?: string | null;
+  address_normalized?: string | null;
+  lat?: number | null;
+  lng?: number | null;
+  knocks?: number | null;
+  potential_lead_count?: number | null;
+  last_knocked_at?: string | null;
+  last_outcome?: string | null;
+  last_homeowner_name?: string | null;
+  last_potential_lead_at?: string | null;
+  resolved_lead_status?: string | null;
+  last_knocked_rep_id?: string | null;
+  last_knocked_rep_name?: string | null;
+  rep_count?: number | null;
+  total_count?: number | null;
+};
+
+type ViewportBounds = {
+  minLat: number;
+  maxLat: number;
+  minLng: number;
+  maxLng: number;
+};
+
 type JobStageRow = {
   id: string;
   stage_id: number | null;
@@ -241,7 +266,10 @@ function getLeadStatusMarkerIcon(maps: any, status: LeadStatus | null) {
   };
 }
 
-function getMarkerInfoWindowContent(pin: DoorPin) {
+function getMarkerInfoWindowContent(pin: DoorPin, showRepAttribution: boolean) {
+  const repLine = showRepAttribution
+    ? `<br/><span>Last rep who knocked: ${pin.lastKnockedRepName ?? pin.lastKnockedRepId ?? "-"}</span>`
+    : "";
   return `
     <div style="font-family: system-ui; min-width: 240px; color: var(--ink); background: var(--panel); padding: 4px 6px; border-radius: 8px;">
       <strong>${pin.address}</strong><br/>
@@ -249,7 +277,7 @@ function getMarkerInfoWindowContent(pin: DoorPin) {
       <span>Last activity: ${formatDateTime(pin.lastKnockedAt)}</span><br/>
       <span>Outcome: ${displayOutcome(pin.knocks > 0 ? pin.lastOutcome : "potential_lead")}</span><br/>
       <span>Lead status: ${getLeadStatusLabel(pin.resolvedLeadStatus)}</span><br/>
-      <span>Homeowner: ${pin.lastHomeownerName ?? "-"}</span>
+      <span>Homeowner: ${pin.lastHomeownerName ?? "-"}</span>${repLine}
     </div>
   `;
 }
@@ -278,6 +306,34 @@ function toDateMs(value: string | null | undefined) {
   const parsed = new Date(value);
   const ms = parsed.getTime();
   return Number.isFinite(ms) ? ms : 0;
+}
+
+function mapPagedPinRowToDoorPin(row: PagedDoorPinRow): DoorPin | null {
+  const address = toNonEmptyString(row.address);
+  if (!address) return null;
+  return {
+    address,
+    lat: toNumber(row.lat),
+    lng: toNumber(row.lng),
+    knocks: Number(row.knocks ?? 0),
+    knockEventIds: [],
+    potentialLeadCount: Number(row.potential_lead_count ?? 0),
+    lastKnockedAt:
+      typeof row.last_knocked_at === "string" ? row.last_knocked_at : null,
+    lastOutcome: toNonEmptyString(row.last_outcome),
+    lastHomeownerName: toNonEmptyString(row.last_homeowner_name),
+    latestPotentialLeadNote: null,
+    lastPotentialLeadAt:
+      typeof row.last_potential_lead_at === "string"
+        ? row.last_potential_lead_at
+        : null,
+    lastPotentialLeadRepId: null,
+    lastPotentialLeadRepName: null,
+    lastKnockedRepId: toNonEmptyString(row.last_knocked_rep_id),
+    lastKnockedRepName: toNonEmptyString(row.last_knocked_rep_name),
+    resolvedLeadStatus: parseLeadStatus(row.resolved_lead_status),
+    repCount: Number(row.rep_count ?? 0),
+  };
 }
 
 function formatDateTime(value: string | null) {
@@ -561,6 +617,16 @@ export default function KnockingDoorsPage() {
   >({});
 
   const [searchTerm, setSearchTerm] = useState("");
+  const [pageSize, setPageSize] = useState<10 | 25>(25);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalRows, setTotalRows] = useState(0);
+  const [pagedPins, setPagedPins] = useState<DoorPin[]>([]);
+  const [loadingPagedPins, setLoadingPagedPins] = useState(false);
+  const [pagedPinsError, setPagedPinsError] = useState<string | null>(null);
+  const [viewportSyncEnabled, setViewportSyncEnabled] = useState(true);
+  const [viewportBounds, setViewportBounds] = useState<ViewportBounds | null>(
+    null,
+  );
   const [refreshNonce, setRefreshNonce] = useState(0);
 
   const [loadingPins, setLoadingPins] = useState(true);
@@ -615,6 +681,8 @@ export default function KnockingDoorsPage() {
   const mapNodeRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const mapsApiRef = useRef<any>(null);
+  const mapIdleDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mapHasAutoFitPinsRef = useRef(false);
   const markersRef = useRef<Map<string, any>>(new Map());
   const heatmapCirclesRef = useRef<any[]>([]);
   const drawingManagerRef = useRef<any>(null);
@@ -663,21 +731,30 @@ export default function KnockingDoorsPage() {
     () => pins.filter((pin) => pin.potentialLeadCount > 0).length,
     [pins],
   );
-
-  const filteredPins = useMemo(() => {
-    const query = searchTerm.trim().toLowerCase();
-    if (!query) return pins;
-    return pins.filter((pin) => {
-      const addressMatch = pin.address.toLowerCase().includes(query);
-      const homeownerMatch = (pin.lastHomeownerName ?? "")
-        .toLowerCase()
-        .includes(query);
-      const outcomeMatch = (pin.lastOutcome ?? "").toLowerCase().includes(query);
-      return addressMatch || homeownerMatch || outcomeMatch;
+  const pinByAddressKey = useMemo(() => {
+    const map = new Map<string, DoorPin>();
+    pins.forEach((pin) => {
+      map.set(normalizeAddress(pin.address), pin);
     });
-  }, [pins, searchTerm]);
+    return map;
+  }, [pins]);
 
-  const visiblePins = useMemo(() => filteredPins.slice(0, 24), [filteredPins]);
+  const listPins = useMemo(
+    () =>
+      pagedPins.map(
+        (pin) => pinByAddressKey.get(normalizeAddress(pin.address)) ?? pin,
+      ),
+    [pagedPins, pinByAddressKey],
+  );
+
+  const totalPages = useMemo(
+    () => Math.max(1, Math.ceil(totalRows / pageSize)),
+    [pageSize, totalRows],
+  );
+
+  useEffect(() => {
+    setCurrentPage((previous) => Math.min(previous, totalPages));
+  }, [totalPages]);
 
   const leadsByAddress = useMemo(() => {
     const grouped = new Map<string, PotentialLeadRow[]>();
@@ -1219,6 +1296,90 @@ export default function KnockingDoorsPage() {
     };
   }, [googleKey, managerView, refreshNonce, supabase, user]);
 
+  const viewportBoundsKey = useMemo(() => {
+    if (!viewportSyncEnabled || !viewportBounds) return "off";
+    return [
+      viewportBounds.minLat.toFixed(6),
+      viewportBounds.maxLat.toFixed(6),
+      viewportBounds.minLng.toFixed(6),
+      viewportBounds.maxLng.toFixed(6),
+    ].join("|");
+  }, [viewportBounds, viewportSyncEnabled]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [activeMapStatusFilters, pageSize, searchTerm, viewportBoundsKey]);
+
+  useEffect(() => {
+    if (!user) return;
+    if (mapMode !== "pins") return;
+
+    let active = true;
+    const loadPagedPinList = async () => {
+      setLoadingPagedPins(true);
+      setPagedPinsError(null);
+
+      const statusFilters =
+        activeMapStatusFilters.length === LEAD_STATUS_LEGEND.length
+          ? null
+          : activeMapStatusFilters;
+      const bounds = viewportSyncEnabled ? viewportBounds : null;
+
+      const { data, error } = await supabase.rpc(
+        "list_knock_door_pins_paginated",
+        {
+          p_page: currentPage,
+          p_page_size: pageSize,
+          p_search_term: searchTerm.trim() || null,
+          p_status_filters: statusFilters,
+          p_min_lat: bounds?.minLat ?? null,
+          p_max_lat: bounds?.maxLat ?? null,
+          p_min_lng: bounds?.minLng ?? null,
+          p_max_lng: bounds?.maxLng ?? null,
+          p_manager_view: managerView,
+        },
+      );
+
+      if (!active) return;
+
+      if (error) {
+        setPagedPins([]);
+        setTotalRows(0);
+        setPagedPinsError(error.message);
+        setLoadingPagedPins(false);
+        return;
+      }
+
+      const rows = (data ?? []) as PagedDoorPinRow[];
+      const nextPins = rows
+        .map((row) => mapPagedPinRowToDoorPin(row))
+        .filter((row): row is DoorPin => row !== null);
+
+      const totalCountFromRpc = Number(rows[0]?.total_count ?? 0);
+      setPagedPins(nextPins);
+      setTotalRows(Number.isFinite(totalCountFromRpc) ? totalCountFromRpc : 0);
+      setLoadingPagedPins(false);
+    };
+
+    void loadPagedPinList();
+
+    return () => {
+      active = false;
+    };
+  }, [
+    activeMapStatusFilters,
+    currentPage,
+    managerView,
+    mapMode,
+    pageSize,
+    refreshNonce,
+    searchTerm,
+    supabase,
+    user,
+    viewportBounds,
+    viewportSyncEnabled,
+  ]);
+
   useEffect(() => {
     if (!user) return;
     if (mapMode !== "heatmap") return;
@@ -1267,6 +1428,7 @@ export default function KnockingDoorsPage() {
     if (!user) return;
     if (!mapNodeRef.current) return;
     let active = true;
+    let mapIdleListener: { remove: () => void } | null = null;
 
     const waitForMapNodeSize = async (node: HTMLDivElement) => {
       const deadline = Date.now() + 3000;
@@ -1311,6 +1473,49 @@ export default function KnockingDoorsPage() {
         });
 
         mapRef.current = map;
+        mapIdleListener = map.addListener("idle", () => {
+          if (mapIdleDebounceRef.current) {
+            clearTimeout(mapIdleDebounceRef.current);
+          }
+
+          mapIdleDebounceRef.current = setTimeout(() => {
+            const bounds = map.getBounds?.();
+            if (!bounds) return;
+
+            const northEast = bounds.getNorthEast?.();
+            const southWest = bounds.getSouthWest?.();
+            if (!northEast || !southWest) return;
+
+            const nextBounds: ViewportBounds = {
+              minLat: Number(southWest.lat?.()),
+              maxLat: Number(northEast.lat?.()),
+              minLng: Number(southWest.lng?.()),
+              maxLng: Number(northEast.lng?.()),
+            };
+
+            if (
+              !Number.isFinite(nextBounds.minLat) ||
+              !Number.isFinite(nextBounds.maxLat) ||
+              !Number.isFinite(nextBounds.minLng) ||
+              !Number.isFinite(nextBounds.maxLng)
+            ) {
+              return;
+            }
+
+            setViewportBounds((previous) => {
+              if (
+                previous &&
+                Math.abs(previous.minLat - nextBounds.minLat) < 0.000001 &&
+                Math.abs(previous.maxLat - nextBounds.maxLat) < 0.000001 &&
+                Math.abs(previous.minLng - nextBounds.minLng) < 0.000001 &&
+                Math.abs(previous.maxLng - nextBounds.maxLng) < 0.000001
+              ) {
+                return previous;
+              }
+              return nextBounds;
+            });
+          }, 250);
+        });
         window.requestAnimationFrame(() => {
           maps.event.trigger(map, "resize");
         });
@@ -1328,6 +1533,11 @@ export default function KnockingDoorsPage() {
 
     return () => {
       active = false;
+      if (mapIdleDebounceRef.current) {
+        clearTimeout(mapIdleDebounceRef.current);
+        mapIdleDebounceRef.current = null;
+      }
+      mapIdleListener?.remove?.();
       routeCircleListenersRef.current.forEach((listener) =>
         listener?.remove?.(),
       );
@@ -1376,7 +1586,7 @@ export default function KnockingDoorsPage() {
       const id = normalizeAddress(pin.address);
       const position = { lat: pin.lat, lng: pin.lng };
       const markerIcon = getLeadStatusMarkerIcon(maps, pin.resolvedLeadStatus);
-      const infoContent = getMarkerInfoWindowContent(pin);
+      const infoContent = getMarkerInfoWindowContent(pin, managerView);
 
       const existing = markersRef.current.get(id);
       if (existing) {
@@ -1405,7 +1615,7 @@ export default function KnockingDoorsPage() {
       markersRef.current.set(id, marker);
     });
 
-    if (mapVisiblePins.length > 0) {
+    if (mapVisiblePins.length > 0 && !mapHasAutoFitPinsRef.current) {
       const bounds = new maps.LatLngBounds();
       mapVisiblePins.forEach((pin) => {
         if (pin.lat !== null && pin.lng !== null) {
@@ -1413,8 +1623,14 @@ export default function KnockingDoorsPage() {
         }
       });
       mapRef.current.fitBounds(bounds, 64);
+      mapHasAutoFitPinsRef.current = true;
     }
-  }, [mapMode, mapReady, mapVisiblePins]);
+  }, [managerView, mapMode, mapReady, mapVisiblePins]);
+
+  useEffect(() => {
+    if (mapMode === "pins") return;
+    mapHasAutoFitPinsRef.current = false;
+  }, [mapMode]);
 
   useEffect(() => {
     if (!mapReady || !mapRef.current) return;
@@ -2752,12 +2968,47 @@ export default function KnockingDoorsPage() {
           Map status filters: {activeMapStatusFilters.length}/
           {LEAD_STATUS_LEGEND.length} selected
         </p>
+        <div className="row" style={{ marginTop: 8, gap: 8 }}>
+          <label className="hint" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={viewportSyncEnabled}
+              onChange={(event) => setViewportSyncEnabled(event.target.checked)}
+            />
+            Visible on map
+          </label>
+          <div className="row" style={{ gap: 6 }}>
+            <span className="hint">Per page</span>
+            <button
+              type="button"
+              className={pageSize === 10 ? "tab tab-active" : "tab"}
+              onClick={() => setPageSize(10)}
+            >
+              10
+            </button>
+            <button
+              type="button"
+              className={pageSize === 25 ? "tab tab-active" : "tab"}
+              onClick={() => setPageSize(25)}
+            >
+              25
+            </button>
+          </div>
+          <span className="hint">
+            {loadingPagedPins
+              ? "Loading list..."
+              : totalRows > 0
+                ? `Showing ${(currentPage - 1) * pageSize + 1}-${Math.min(totalRows, currentPage * pageSize)} of ${totalRows}`
+                : "No matching addresses"}
+          </span>
+        </div>
+        {pagedPinsError ? <p className="error">{pagedPinsError}</p> : null}
         </>
         ) : null}
 
-        {mapMode === "pins" && visiblePins.length > 0 ? (
+        {mapMode === "pins" && listPins.length > 0 ? (
           <div className="jobs" style={{ marginTop: 12 }}>
-            {visiblePins.map((pin) => {
+            {listPins.map((pin) => {
               const pinKey = normalizeAddress(pin.address);
               const expanded = expandedPinKeys.includes(pinKey);
               const leadsForAddress = leadsByAddress.get(pinKey) ?? [];
@@ -3395,18 +3646,37 @@ export default function KnockingDoorsPage() {
               );
             })}
 
-            {filteredPins.length > visiblePins.length ? (
-              <p className="hint">
-                Showing first {visiblePins.length} of {filteredPins.length}{" "}
-                matched addresses.
-              </p>
+            {totalRows > 0 ? (
+              <div className="row" style={{ marginTop: 8 }}>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => setCurrentPage((previous) => Math.max(1, previous - 1))}
+                  disabled={currentPage <= 1 || loadingPagedPins}
+                >
+                  Previous
+                </button>
+                <span className="hint">
+                  Page {currentPage} of {totalPages}
+                </span>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() =>
+                    setCurrentPage((previous) => Math.min(totalPages, previous + 1))
+                  }
+                  disabled={currentPage >= totalPages || loadingPagedPins}
+                >
+                  Next
+                </button>
+              </div>
             ) : null}
           </div>
         ) : mapMode === "pins" ? (
           <p className="hint" style={{ marginTop: 12 }}>
-            {pins.length === 0
+            {totalRows === 0
               ? "No knocked doors or potential leads found."
-              : "No addresses match your search filter."}
+              : "No addresses match your current map/list filters."}
           </p>
         ) : (
           <p className="hint" style={{ marginTop: 12 }}>

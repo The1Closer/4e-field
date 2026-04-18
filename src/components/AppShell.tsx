@@ -189,18 +189,21 @@ export function AppShell({ role, profileName, profileImageUrl, onSignOut, debug,
 
       <aside className={menuOpen ? "shell-drawer shell-drawer-open" : "shell-drawer"} aria-hidden={!menuOpen}>
         <div className="shell-drawer-inner">
-          <div className="row">
-            <h3 style={{ margin: 0 }}>Menu</h3>
+          <div className="shell-drawer-head">
+            <div className="shell-drawer-title-wrap">
+              <p className="shell-drawer-eyebrow">Navigation</p>
+              <h3 className="shell-drawer-title">Menu</h3>
+              <p className="shell-drawer-subtitle">{displayProfileName}</p>
+            </div>
             <button
               type="button"
-              className="secondary icon-btn"
+              className="secondary icon-btn shell-drawer-close"
               onClick={() => setMenuOpen(false)}
               aria-label="Close navigation"
             >
-              X
+              <span aria-hidden="true">×</span>
             </button>
           </div>
-          <p className="hint">Field workflows and reporting.</p>
 
           <nav className="shell-drawer-nav">
             {items.map((item) => (
@@ -209,7 +212,8 @@ export function AppShell({ role, profileName, profileImageUrl, onSignOut, debug,
                 href={item.href}
                 className={isNavItemActive(pathname, item.href) ? "drawer-link drawer-link-active" : "drawer-link"}
               >
-                {item.label}
+                <span>{item.label}</span>
+                <span className="drawer-link-chevron" aria-hidden="true">›</span>
               </Link>
             ))}
           </nav>
