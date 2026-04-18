@@ -386,6 +386,32 @@ select {
   background: var(--panel-soft);
 }
 
+.lead-list-table-wrap {
+  margin-top: 12px;
+  overflow-x: auto;
+}
+
+.lead-list-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+}
+
+.lead-list-table th,
+.lead-list-table td {
+  padding: 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.lead-list-table th {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-faint);
+}
+
 .row {
   display: flex;
   align-items: center;

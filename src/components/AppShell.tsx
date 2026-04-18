@@ -31,9 +31,10 @@ const navItems: NavItem[] = [
   { href: "/jobs", label: "Home" },
   { href: "/knocking", label: "Knocking" },
   { href: "/knocking/doors", label: "Doors Map" },
+  { href: "/knocking/contacts", label: "Lead List" },
 ];
 
-const MOBILE_PRIMARY_HREFS = ["/jobs", "/knocking", "/knocking/doors"];
+const MOBILE_PRIMARY_HREFS = ["/jobs", "/knocking", "/knocking/doors", "/knocking/contacts"];
 const SHOW_DEBUG_BANNER = process.env.NEXT_PUBLIC_SHOW_DEBUG_BANNER === "true";
 
 function isNavItemActive(pathname: string, href: string) {

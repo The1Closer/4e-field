@@ -23,6 +23,7 @@ Run these in order in Supabase SQL editor.
 19. `019_manager_delete_knock_events.sql`
 20. `020_knock_session_inactivity_timeout.sql`
 21. `021_job_geocode_cache.sql`
+22. `022_forever_address_contacts.sql`
 
 Notes:
 - Files are idempotent-safe where practical (`if not exists`, policy guards).
