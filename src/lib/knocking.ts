@@ -1,7 +1,7 @@
 export type SessionStatus = "active" | "paused" | "ended";
 
 export type KnockAction = "knock" | "door_hanger";
-export type KnockOutcome = "no_answer" | "no" | "soft_set" | "inspection";
+export type KnockOutcome = "no_answer" | "no" | "soft_set" | "inspection" | "do_not_knock";
 
 export type NightlyDelta = {
   knocks: number;
@@ -57,8 +57,12 @@ export function getEventDelta(params: {
   }
 
   const outcome = params.outcome ?? "no_answer";
-  if (outcome === "no_answer" || outcome === "no") {
+  if (outcome === "no_answer" || outcome === "do_not_knock") {
     return { ...ZERO_DELTA, knocks: 1 };
+  }
+
+  if (outcome === "no") {
+    return { ...ZERO_DELTA, knocks: 1, talks: 1 };
   }
 
   if (outcome === "soft_set") {

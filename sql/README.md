@@ -24,6 +24,7 @@ Run these in order in Supabase SQL editor.
 20. `020_knock_session_inactivity_timeout.sql`
 21. `021_job_geocode_cache.sql`
 22. `022_forever_address_contacts.sql`
+23. `023_do_not_knock_outcome_and_visibility.sql`
 
 Notes:
 - Files are idempotent-safe where practical (`if not exists`, policy guards).

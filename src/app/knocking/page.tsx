@@ -307,6 +307,7 @@ function displayOutcome(value: string | null | undefined) {
   if (value === "no_answer") return "No Answer";
   if (value === "soft_set") return "Soft Set";
   if (value === "inspection") return "Inspection";
+  if (value === "do_not_knock") return "Do Not Knock";
   if (value === "no") return "No";
   return "Unknown";
 }
@@ -2021,6 +2022,7 @@ export default function KnockingPage() {
       const eventAddress = homeownerIntake.address.trim() || doorAddress.trim() || currentAddress;
       const isInspection = params.action === "knock" && params.outcome === "inspection";
       const isSoftSet = params.action === "knock" && params.outcome === "soft_set";
+      const isDoNotKnock = params.action === "knock" && params.outcome === "do_not_knock";
       const isContingent = isInspection
         ? params.contingentOverride ?? inspectionChecklist.contingent
         : false;
@@ -2068,6 +2070,21 @@ export default function KnockingPage() {
                 }
             : { queued_offline: true },
         });
+
+        if (isDoNotKnock && eventAddress.trim().length > 0) {
+          await queueOperation("knock_potential_leads", {
+            rep_id: user.id,
+            address: eventAddress,
+            address_normalized: normalizeAddress(eventAddress),
+            homeowner_name: homeownerIntake.homeownerName.trim() || null,
+            homeowner_phone: homeownerIntake.phone.trim() || null,
+            homeowner_email: homeownerIntake.email.trim() || null,
+            lead_status: "do_not_knock",
+            notes: "Marked as Do Not Knock from knock outcome.",
+            latitude: currentLat,
+            longitude: currentLng,
+          });
+        }
 
         const optimisticId = `offline-${crypto.randomUUID()}`;
         const optimisticEvent: SessionKnockEventRow = {
@@ -2596,6 +2613,27 @@ export default function KnockingPage() {
         setSessionEvents((previous) => [inserted, ...previous.filter((row) => row.id !== inserted.id)]);
       }
 
+      if (isDoNotKnock && eventAddress.trim().length > 0) {
+        const doNotKnockLeadPayload = {
+          rep_id: user.id,
+          address: eventAddress,
+          address_normalized: normalizeAddress(eventAddress),
+          homeowner_name: homeownerIntake.homeownerName.trim() || null,
+          homeowner_phone: homeownerIntake.phone.trim() || null,
+          homeowner_email: homeownerIntake.email.trim() || null,
+          lead_status: "do_not_knock",
+          notes: "Marked as Do Not Knock from knock outcome.",
+          latitude: currentLat,
+          longitude: currentLng,
+        };
+        const { error: doNotKnockLeadError } = await supabase
+          .from("knock_potential_leads")
+          .upsert(doNotKnockLeadPayload, { onConflict: "rep_id,address_normalized" });
+        if (doNotKnockLeadError) {
+          postSaveWarnings.push(`Do Not Knock lead tag warning: ${doNotKnockLeadError.message}`);
+        }
+      }
+
       if (includeInNightlyNumbers) {
         setTodayTotals((previous) => mergeNightlyDelta(previous, delta));
         try {
@@ -2627,15 +2665,17 @@ export default function KnockingPage() {
           ? `${baseMessage} Warning: ${postSaveWarnings.join(" ")}`
           : baseMessage,
       );
-    } catch (e) {
+      } catch (e) {
       if (likelyNetworkError(e)) {
         try {
+          const fallbackAddress =
+            homeownerIntake.address.trim() || doorAddress.trim() || currentAddress || "";
           await queueOperation("knock_events", {
             session_id: session.id,
             rep_id: user.id,
             action: params.action,
             outcome: params.action === "knock" ? params.outcome ?? null : null,
-            address: homeownerIntake.address.trim() || doorAddress.trim() || currentAddress || null,
+            address: fallbackAddress || null,
             homeowner_name: homeownerIntake.homeownerName.trim() || null,
             homeowner_phone: homeownerIntake.phone.trim() || null,
             homeowner_email: homeownerIntake.email.trim() || null,
@@ -2650,6 +2690,25 @@ export default function KnockingPage() {
                   }
               : {},
           });
+
+          if (
+            params.action === "knock" &&
+            params.outcome === "do_not_knock" &&
+            fallbackAddress.trim().length > 0
+          ) {
+            await queueOperation("knock_potential_leads", {
+              rep_id: user.id,
+              address: fallbackAddress,
+              address_normalized: normalizeAddress(fallbackAddress),
+              homeowner_name: homeownerIntake.homeownerName.trim() || null,
+              homeowner_phone: homeownerIntake.phone.trim() || null,
+              homeowner_email: homeownerIntake.email.trim() || null,
+              lead_status: "do_not_knock",
+              notes: "Marked as Do Not Knock from knock outcome.",
+              latitude: currentLat,
+              longitude: currentLng,
+            });
+          }
           setError(null);
           setMessage("Network issue. Event queued for auto-sync.");
         } catch (queueError) {
@@ -2672,7 +2731,7 @@ export default function KnockingPage() {
   async function onOutcomeSelect(outcome: KnockOutcome) {
     setEventOutcome(outcome);
 
-    if (outcome === "no" || outcome === "no_answer") {
+    if (outcome === "no" || outcome === "no_answer" || outcome === "do_not_knock") {
       await logEvent({ action: "knock", outcome });
       return;
     }
@@ -2958,6 +3017,9 @@ export default function KnockingPage() {
               </button>
               <button onClick={() => void onOutcomeSelect("inspection")} disabled={saving}>
                 Inspection
+              </button>
+              <button className="danger" onClick={() => void onOutcomeSelect("do_not_knock")} disabled={saving}>
+                Do Not Knock
               </button>
             </div>
             <button className="secondary" onClick={() => setStep("door")} disabled={saving}>

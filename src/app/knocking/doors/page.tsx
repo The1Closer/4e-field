@@ -377,6 +377,7 @@ function displayOutcome(value: string | null) {
   if (value === "no_answer") return "No Answer";
   if (value === "soft_set") return "Soft Set";
   if (value === "inspection") return "Inspection";
+  if (value === "do_not_knock") return "Do Not Knock";
   if (value === "no") return "No";
   if (value === "potential_lead") return "Potential Lead";
   return value ?? "-";
@@ -794,7 +795,7 @@ export default function KnockingDoorsPage() {
         .limit(5000);
       if (!managerView) {
         eventsQuery.eq("rep_id", user.id);
-        leadsQuery.eq("rep_id", user.id);
+        leadsQuery.or(`rep_id.eq.${user.id},lead_status.eq.do_not_knock`);
       }
 
       const [eventsResult, initialLeadsResult] = await Promise.all([
@@ -831,7 +832,7 @@ export default function KnockingDoorsPage() {
           .order("created_at", { ascending: false })
           .limit(5000);
         if (!managerView) {
-          fallbackLeadsQuery.eq("rep_id", user.id);
+          fallbackLeadsQuery.or(`rep_id.eq.${user.id},lead_status.eq.do_not_knock`);
         }
         const fallbackLeadsResult = await fallbackLeadsQuery;
 
