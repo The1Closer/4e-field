@@ -32,7 +32,7 @@ function getCrmBaseUrl() {
     process.env.NEXT_PUBLIC_CRM_API_BASE_URL ?? process.env.CRM_API_BASE_URL;
 
   if (!base || base.trim().length === 0) {
-    throw new Error("Missing CRM base URL env: NEXT_PUBLIC_CRM_API_BASE_URL");
+    throw new Error("Missing CRM base URL env: CRM_API_BASE_URL");
   }
 
   return base.replace(/\/+$/, "");
@@ -123,20 +123,23 @@ async function proxyToCrm(request: NextRequest, context: RouteContext) {
     });
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
+      console.error("[crm-proxy] upstream timeout", { path: pathname, timeoutMs });
       return NextResponse.json(
         {
           error: "CRM upstream request timed out.",
           detail: `Timed out after ${timeoutMs}ms.`,
-          target: target.toString(),
         },
         { status: 504 },
       );
     }
+    console.error("[crm-proxy] upstream fetch failed", {
+      path: pathname,
+      message: error instanceof Error ? error.message : String(error),
+    });
     return NextResponse.json(
       {
         error: "CRM upstream request failed.",
         detail: error instanceof Error ? error.message : "Unknown network error.",
-        target: target.toString(),
       },
       { status: 502 },
     );
@@ -150,13 +153,17 @@ async function proxyToCrm(request: NextRequest, context: RouteContext) {
     const titleMatch = html.match(/<title>([^<]+)<\/title>/i);
     const upstreamTitle = titleMatch?.[1]?.trim() ?? null;
 
+    console.error("[crm-proxy] upstream HTML error", {
+      path: pathname,
+      status: upstreamResponse.status,
+      upstreamTitle,
+    });
     return NextResponse.json(
       {
         error: `CRM returned HTML error page (HTTP ${upstreamResponse.status}).`,
         detail: upstreamTitle
           ? `Upstream page title: ${upstreamTitle}`
           : "Check CRM deployment logs for this endpoint.",
-        target: target.toString(),
       },
       { status: upstreamResponse.status },
     );
