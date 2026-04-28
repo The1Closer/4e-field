@@ -3,8 +3,16 @@ export const dynamic = "force-dynamic";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { NextRequest, NextResponse } from "next/server";
-import { PDFDocument, PDFFont, PDFImage, PDFPage, StandardFonts, rgb } from "pdf-lib";
+import { PDFDocument, PDFImage, StandardFonts, rgb } from "pdf-lib";
 import { getRouteSupabaseClient, getRouteUserId } from "@/lib/server-supabase";
+import { THEME } from "@/lib/pdf/theme";
+import { createPdfContext, truncateToWidth, wrapText } from "@/lib/pdf/layout";
+import { ROOF_COMPONENT_BY_KEY, ROOF_COMPONENT_GROUP_LABELS, ROOF_COMPONENT_GROUP_ORDER, ROOF_COMPONENTS } from "@/lib/roof-components";
+import { collateralLabel } from "@/lib/exterior-collateral-taxonomy";
+import { migrateComponentItem } from "@/types/inspection";
+import type { DetachedBuilding, ExteriorCollateralItem, PersonalPropertyRoom } from "@/types/inspection";
+
+const { page: PAGE, spacing: SP, typography: TY, colors: C } = THEME;
 
 type RouteContext = {
   params: Promise<{ id: string }> | { id: string };
@@ -21,14 +29,14 @@ type InspectionPhotoRow = {
 };
 
 type ReportPayload = {
-  // v2 legacy fields
+  // v2 legacy
   sections?: Record<string, unknown>;
   homeowner?: Record<string, unknown>;
   roofOverview?: Record<string, unknown>;
   interiorAttic?: Record<string, unknown>;
   signature?: Record<string, unknown>;
   notes?: unknown;
-  // v3 builder fields
+  // v3 builder
   builderSections?: Array<{
     key: string;
     title: string;
@@ -36,27 +44,31 @@ type ReportPayload = {
     includePhotos: boolean;
     photoIds: string[];
   }>;
-  builderCover?: {
-    intro: string;
-    coverPhotoId: string | null;
-  };
-  builderClosing?: {
-    notes: string;
-  };
-  // v3 metadata
-  testSquares?: Array<{
-    id: string;
-    slope: string;
-    photoId: string | null;
-    hitCount: number | null;
-    note: string;
-  }>;
+  builderCover?: { intro: string; coverPhotoId: string | null };
+  builderClosing?: { notes: string };
+  // Shared v3 metadata
+  testSquares?: Array<{ id: string; slope: string; photoId: string | null; hitCount: number | null; note: string }>;
   sectionConditions?: Record<string, string>;
+  sectionNotes?: Record<string, string>;
+  componentPresence?: Record<string, unknown>;
+  shingleLengthInches?: string | null;
+  shingleWidthInches?: string | null;
+  dripEdgePresent?: string | null;
+  estimatedRoofAgeYears?: number | null;
+  layerCount?: string | null;
+  homeownerName?: string;
+  address?: string;
+  phone?: string;
+  claimNumber?: string;
+  insuranceCarrier?: string;
+  adjuster?: string;
+  inspectorName?: string;
+  // v3 coverage extensions
+  personalProperty?: PersonalPropertyRoom[];
+  exteriorCollateral?: ExteriorCollateralItem[];
+  detachedBuildings?: DetachedBuilding[];
 };
 
-const PAGE_WIDTH = 612;
-const PAGE_HEIGHT = 792;
-const MARGIN = 40;
 const MAX_REPORT_PHOTOS = 80;
 const PHOTO_EMBED_BATCH_SIZE = 6;
 
@@ -65,240 +77,83 @@ async function getId(context: RouteContext) {
   return resolved.id;
 }
 
-function sectionLabel(section: string | null) {
-  switch (section) {
-    case "perimeter_photos":
-      return "Perimeter";
-    case "collateral_damage":
-      return "Collateral";
-    case "roof_overview":
-      return "Roof Overview";
-    case "roof_damage":
-      return "Roof Damage";
-    case "interior_attic":
-      return "Interior/Attic";
-    default:
-      return "Other";
-  }
+function humanSection(section: string | null) {
+  const map: Record<string, string> = {
+    perimeter_photos: "Perimeter", perimeter: "Perimeter",
+    collateral_damage: "Collateral Damage",
+    roof_overview: "Roof Overview", roof: "Roof",
+    roof_damage: "Roof Damage", damage: "Roof Damage",
+    interior_attic: "Interior / Attic", interior: "Interior", attic: "Attic",
+    siding: "Siding", gutters: "Gutters", windows: "Windows",
+    roof_damage_test_square: "Test Square",
+  };
+  return map[section ?? ""] ?? (section ?? "Other");
 }
 
 function sectionSortKey(section: string | null) {
-  switch (section) {
-    case "perimeter_photos":
-      return 0;
-    case "collateral_damage":
-      return 1;
-    case "roof_overview":
-      return 2;
-    case "roof_damage":
-      return 3;
-    case "interior_attic":
-      return 4;
-    default:
-      return 9;
-  }
-}
-
-function formatDateTime(value: string | Date) {
-  const date = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleString();
+  const order: Record<string, number> = {
+    perimeter_photos: 0, perimeter: 0,
+    collateral_damage: 1,
+    roof_overview: 2, roof: 2,
+    roof_damage: 3, damage: 3,
+    interior_attic: 4, interior: 4, attic: 4,
+    siding: 5, gutters: 6, windows: 7,
+  };
+  return order[section ?? ""] ?? 9;
 }
 
 function toDisplay(value: unknown) {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : "-";
-  }
+  if (typeof value === "string") { const t = value.trim(); return t.length > 0 ? t : "—"; }
   if (typeof value === "number") return String(value);
   if (typeof value === "boolean") return value ? "Yes" : "No";
-  return "-";
+  return "—";
 }
 
-function truncateToWidth(text: string, font: PDFFont, size: number, maxWidth: number) {
-  const clean = text.trim();
-  if (!clean) return "";
-  if (font.widthOfTextAtSize(clean, size) <= maxWidth) return clean;
-
-  let left = 0;
-  let right = clean.length;
-  while (left < right) {
-    const mid = Math.ceil((left + right) / 2);
-    const candidate = `${clean.slice(0, mid)}...`;
-    if (font.widthOfTextAtSize(candidate, size) <= maxWidth) {
-      left = mid;
-    } else {
-      right = mid - 1;
-    }
-  }
-  return `${clean.slice(0, Math.max(1, left))}...`;
+function formatDate(d = new Date()) {
+  return d.toLocaleDateString("en-US", { month: "long", day: "numeric", year: "numeric" });
 }
 
-function drawWrappedText(
-  page: PDFPage,
-  text: string,
-  options: {
-    x: number;
-    y: number;
-    maxWidth: number;
-    font: PDFFont;
-    size: number;
-    lineHeight: number;
-    color?: ReturnType<typeof rgb>;
-  },
-) {
-  const words = text.split(/\s+/).filter(Boolean);
-  let line = "";
-  let cursorY = options.y;
-  const color = options.color ?? rgb(0.1, 0.1, 0.1);
-
-  for (const word of words) {
-    const candidate = line ? `${line} ${word}` : word;
-    const width = options.font.widthOfTextAtSize(candidate, options.size);
-    if (width <= options.maxWidth) {
-      line = candidate;
-      continue;
-    }
-
-    if (!line) {
-      page.drawText(word, {
-        x: options.x,
-        y: cursorY,
-        size: options.size,
-        font: options.font,
-        color,
-      });
-      cursorY -= options.lineHeight;
-      continue;
-    }
-
-    page.drawText(line, {
-      x: options.x,
-      y: cursorY,
-      size: options.size,
-      font: options.font,
-      color,
-    });
-    cursorY -= options.lineHeight;
-    line = word;
-  }
-
-  if (line) {
-    page.drawText(line, {
-      x: options.x,
-      y: cursorY,
-      size: options.size,
-      font: options.font,
-      color,
-    });
-    cursorY -= options.lineHeight;
-  }
-
-  return cursorY;
-}
-
-function extractPhotoTags(row: InspectionPhotoRow) {
+function extractPhotoTags(row: InspectionPhotoRow): string[] {
   const tags: string[] = [];
-
-  if (row.damage_cause && row.damage_cause !== "none") {
-    tags.push(row.damage_cause.toUpperCase());
-  }
-
-  for (const piece of (row.notes ?? "").split("|").map((value) => value.trim())) {
+  if (row.damage_cause && row.damage_cause !== "none") tags.push(row.damage_cause.toUpperCase());
+  for (const piece of (row.notes ?? "").split("|").map((v) => v.trim())) {
     if (!piece) continue;
-    if (piece.startsWith("slope:")) {
-      const value = piece.slice(6).trim();
-      if (value) tags.push(`Slope ${value}`);
-      continue;
-    }
-    if (piece.startsWith("component:")) {
-      const value = piece.slice(10).trim();
-      if (value) tags.push(value);
-      continue;
-    }
-    if (piece.startsWith("tag:")) {
-      const value = piece.slice(4).trim();
-      if (value) tags.push(value);
-    }
+    if (piece.startsWith("slope:")) { const v = piece.slice(6).trim(); if (v) tags.push(`${v} slope`); }
+    else if (piece.startsWith("component:")) { const v = piece.slice(10).trim(); if (v) tags.push(ROOF_COMPONENT_BY_KEY.get(v)?.label ?? v); }
+    else if (piece.startsWith("tag:")) { const v = piece.slice(4).trim(); if (v) tags.push(v); }
   }
-
   return Array.from(new Set(tags)).slice(0, 4);
 }
 
-async function loadLocalLogoBytes() {
+function getComponentTag(row: InspectionPhotoRow): string | null {
+  for (const piece of (row.notes ?? "").split("|").map((v) => v.trim())) {
+    if (piece.startsWith("component:")) return piece.slice(10).trim() || null;
+  }
+  return null;
+}
+
+async function loadLogoBytes() {
   try {
-    const logoPath = join(process.cwd(), "public", "4ELogo.png");
-    const buffer = await readFile(logoPath);
-    return new Uint8Array(buffer);
-  } catch (error) {
-    console.warn(
-      JSON.stringify({
-        event: "inspection_pdf_logo_load_failed",
-        reason: error instanceof Error ? error.message : "unknown",
-      }),
-    );
-    return null;
-  }
+    return new Uint8Array(await readFile(join(process.cwd(), "public", "4ELogo.png")));
+  } catch { return null; }
 }
 
-async function embedImage(doc: PDFDocument, bytes: Uint8Array, contentType: string | null, fileName: string) {
-  const lowered = (contentType ?? "").toLowerCase();
-  const loweredName = fileName.toLowerCase();
-  const tryPngFirst = lowered.includes("png") || loweredName.endsWith(".png");
-
-  if (tryPngFirst) {
-    try {
-      return await doc.embedPng(bytes);
-    } catch {
-      try {
-        return await doc.embedJpg(bytes);
-      } catch {
-        return null;
-      }
-    }
+async function embedImage(doc: PDFDocument, bytes: Uint8Array, contentType: string | null, fileName: string): Promise<PDFImage | null> {
+  const isPng = (contentType ?? "").toLowerCase().includes("png") || fileName.toLowerCase().endsWith(".png");
+  const attempts = isPng
+    ? [() => doc.embedPng(bytes), () => doc.embedJpg(bytes)]
+    : [() => doc.embedJpg(bytes), () => doc.embedPng(bytes)];
+  for (const attempt of attempts) {
+    try { return await attempt(); } catch { continue; }
   }
-
-  try {
-    return await doc.embedJpg(bytes);
-  } catch {
-    try {
-      return await doc.embedPng(bytes);
-    } catch {
-      return null;
-    }
-  }
+  console.warn(JSON.stringify({ event: "pdf_image_embed_failed", file: fileName }));
+  return null;
 }
 
-function drawImageFit(
-  page: PDFPage,
-  image: PDFImage,
-  box: { x: number; y: number; width: number; height: number },
-) {
-  const scaled = image.scale(1);
-  const ratio = Math.min(box.width / scaled.width, box.height / scaled.height, 1);
-  const width = scaled.width * ratio;
-  const height = scaled.height * ratio;
-  const x = box.x + (box.width - width) / 2;
-  const y = box.y + (box.height - height) / 2;
-
-  page.drawImage(image, { x, y, width, height });
-}
-
-function isPhotoEnabledBySections(row: InspectionPhotoRow, sections: Record<string, unknown>) {
-  switch (row.capture_section) {
-    case "perimeter_photos":
-      return sections.perimeterPhotos !== false;
-    case "collateral_damage":
-      return sections.collateralDamage !== false;
-    case "roof_overview":
-      return sections.roofOverview !== false;
-    case "roof_damage":
-      return sections.roofDamage !== false;
-    case "interior_attic":
-      return sections.interiorAttic !== false;
-    default:
-      return true;
-  }
+function fitImage(image: PDFImage, maxW: number, maxH: number) {
+  const s = image.scale(1);
+  const ratio = Math.min(maxW / s.width, maxH / s.height, 1);
+  return { width: s.width * ratio, height: s.height * ratio };
 }
 
 export async function POST(request: NextRequest, context: RouteContext) {
@@ -313,10 +168,6 @@ export async function POST(request: NextRequest, context: RouteContext) {
       payload?: ReportPayload;
     };
 
-    const selectedPhotoIds = Array.isArray(body.selectedPhotoIds)
-      ? body.selectedPhotoIds.filter((id) => typeof id === "string" && id.length > 0)
-      : [];
-
     const payload = (body.payload ?? {}) as ReportPayload;
     const sections = (payload.sections ?? {}) as Record<string, unknown>;
     const homeowner = (payload.homeowner ?? {}) as Record<string, unknown>;
@@ -324,15 +175,26 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const interiorAttic = (payload.interiorAttic ?? {}) as Record<string, unknown>;
     const signature = (payload.signature ?? {}) as Record<string, unknown>;
 
-    // v3 builder fields
     const builderSections = Array.isArray(payload.builderSections) ? payload.builderSections : null;
     const builderCover = payload.builderCover ?? null;
     const builderClosing = payload.builderClosing ?? null;
     const testSquares = Array.isArray(payload.testSquares) ? payload.testSquares : [];
+    const sectionConditions = payload.sectionConditions ?? {};
+    const sectionNotes = payload.sectionNotes ?? {};
+    const componentPresence = payload.componentPresence ?? {};
+    const selectedPhotoIds = Array.isArray(body.selectedPhotoIds)
+      ? body.selectedPhotoIds.filter((id): id is string => typeof id === "string")
+      : [];
+
+    const title = (body.title || "Inspection Report").trim() || "Inspection Report";
+    const reportDate = formatDate();
+    const homeownerName = toDisplay(payload.homeownerName ?? homeowner.homeownerName);
+    const address = toDisplay(payload.address ?? homeowner.address);
+    const claimNumber = toDisplay(payload.claimNumber ?? homeowner.claimNumber);
+    const insuranceCarrier = toDisplay(payload.insuranceCarrier ?? homeowner.insuranceCarrier);
 
     const supabase = getRouteSupabaseClient(request);
 
-    // Collect all photo IDs we need — from selectedPhotoIds (v2) or all builder section photoIds (v3)
     const allNeededPhotoIds = builderSections
       ? [...new Set(builderSections.flatMap((s) => s.photoIds))]
       : selectedPhotoIds;
@@ -349,487 +211,553 @@ export async function POST(request: NextRequest, context: RouteContext) {
     if (photoError) throw new Error(photoError.message);
 
     const rowMap = new Map<string, InspectionPhotoRow>();
-    for (const row of (photoRows ?? []) as InspectionPhotoRow[]) {
-      rowMap.set(row.id, row);
-    }
+    for (const row of (photoRows ?? []) as InspectionPhotoRow[]) rowMap.set(row.id, row);
 
-    // Build ordered rows for the gallery
     let orderedRows: InspectionPhotoRow[];
     if (builderSections) {
-      // v3: respect the builder section order and per-section photo lists
       orderedRows = builderSections
         .filter((s) => s.visible && s.includePhotos)
         .flatMap((s) => s.photoIds.map((id) => rowMap.get(id)).filter((r): r is InspectionPhotoRow => Boolean(r)));
     } else {
       orderedRows = selectedPhotoIds
         .map((id) => rowMap.get(id))
-        .filter((row): row is InspectionPhotoRow => Boolean(row))
-        .filter((row) => isPhotoEnabledBySections(row, sections))
+        .filter((r): r is InspectionPhotoRow => Boolean(r))
         .sort((a, b) => sectionSortKey(a.capture_section) - sectionSortKey(b.capture_section));
     }
     const limitedRows = orderedRows.slice(0, MAX_REPORT_PHOTOS);
-    const omittedPhotoCount = Math.max(0, orderedRows.length - limitedRows.length);
+    const omittedCount = Math.max(0, orderedRows.length - limitedRows.length);
 
+    // ── Document setup ─────────────────────────────────────────────────────────
     const doc = await PDFDocument.create();
     const font = await doc.embedFont(StandardFonts.Helvetica);
     const bold = await doc.embedFont(StandardFonts.HelveticaBold);
-    const title = (body.title || "Inspection Report").trim() || "Inspection Report";
+    const logoBytes = await loadLogoBytes();
 
-    // ── v3 Cover page (only when builder intro is provided) ────────────────
-    if (builderCover?.intro?.trim()) {
-      const coverPage = doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
+    // Pre-embed logo
+    let logoImage: PDFImage | null = null;
+    if (logoBytes) logoImage = await embedImage(doc, logoBytes, "image/png", "4ELogo.png");
 
-      // Brand blue header bar
-      coverPage.drawRectangle({ x: 0, y: PAGE_HEIGHT - 120, width: PAGE_WIDTH, height: 120, color: rgb(0.12, 0.31, 0.55) });
+    // ── COVER PAGE ─────────────────────────────────────────────────────────────
+    {
+      const coverPage = doc.addPage([PAGE.width, PAGE.height]);
 
-      const logoBytes = await loadLocalLogoBytes();
-      if (logoBytes) {
-        const logoImage = await embedImage(doc, logoBytes, "image/png", "4ELogo.png");
-        if (logoImage) {
-          drawImageFit(coverPage, logoImage, { x: PAGE_WIDTH - MARGIN - 120, y: PAGE_HEIGHT - 108, width: 100, height: 88 });
-        }
-      }
-
-      coverPage.drawText(title, { x: MARGIN, y: PAGE_HEIGHT - 52, size: 22, font: bold, color: rgb(1, 1, 1) });
-      coverPage.drawText(`Generated: ${formatDateTime(new Date())}`, {
-        x: MARGIN, y: PAGE_HEIGHT - 72, size: 9, font, color: rgb(0.82, 0.88, 0.97),
-      });
-
-      // Cover photo (if selected)
-      if (builderCover.coverPhotoId) {
-        const coverPhotoRow = rowMap.get(builderCover.coverPhotoId);
-        if (coverPhotoRow) {
-          const dl = await supabase.storage.from("inspection-media").download(coverPhotoRow.file_path);
+      // Find cover photo
+      let coverPhotoImage: PDFImage | null = null;
+      const coverPhotoId = builderCover?.coverPhotoId ?? null;
+      if (coverPhotoId) {
+        const coverRow = rowMap.get(coverPhotoId);
+        if (coverRow) {
+          const dl = await supabase.storage.from("inspection-media").download(coverRow.file_path);
           if (!dl.error && dl.data) {
             const bytes = new Uint8Array(await dl.data.arrayBuffer());
-            const img = await embedImage(doc, bytes, coverPhotoRow.content_type, coverPhotoRow.file_name);
-            if (img) {
-              drawImageFit(coverPage, img, { x: MARGIN, y: PAGE_HEIGHT - 380, width: PAGE_WIDTH - MARGIN * 2, height: 240 });
-            }
+            coverPhotoImage = await embedImage(doc, bytes, coverRow.content_type, coverRow.file_name);
           }
         }
       }
 
-      // Intro paragraph
-      let introCursor = builderCover.coverPhotoId ? PAGE_HEIGHT - 400 : PAGE_HEIGHT - 160;
-      introCursor = drawWrappedText(coverPage, builderCover.intro, {
-        x: MARGIN, y: introCursor, maxWidth: PAGE_WIDTH - MARGIN * 2,
-        font, size: 11, lineHeight: 16, color: rgb(0.12, 0.12, 0.14),
-      });
-    }
-
-    const summaryPage = doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-
-    summaryPage.drawRectangle({
-      x: MARGIN,
-      y: PAGE_HEIGHT - 124,
-      width: PAGE_WIDTH - MARGIN * 2,
-      height: 84,
-      color: rgb(0.95, 0.97, 1),
-      borderColor: rgb(0.83, 0.88, 0.96),
-      borderWidth: 1,
-    });
-
-    const logoBytes = await loadLocalLogoBytes();
-    if (logoBytes) {
-      const logoImage = await embedImage(doc, logoBytes, "image/png", "4ELogo.png");
-      if (logoImage) {
-        drawImageFit(summaryPage, logoImage, {
-          x: PAGE_WIDTH - MARGIN - 140,
-          y: PAGE_HEIGHT - 112,
-          width: 120,
-          height: 60,
-        });
+      if (coverPhotoImage) {
+        // Full-bleed photo
+        const { width: w, height: h } = fitImage(coverPhotoImage, PAGE.width, PAGE.height);
+        const px = (PAGE.width - w) / 2;
+        const py = (PAGE.height - h) / 2;
+        coverPage.drawImage(coverPhotoImage, { x: px, y: py, width: w, height: h });
+        // Dark gradient overlay — stacked translucent rects
+        for (let i = 0; i < 6; i++) {
+          const opacity = 0.08 + i * 0.06;
+          coverPage.drawRectangle({ x: 0, y: 0, width: PAGE.width, height: 260 + i * 10, color: rgb(0.05, 0.10, 0.20), opacity });
+        }
       } else {
-        console.warn(JSON.stringify({ event: "inspection_pdf_logo_embed_failed", reason: "unsupported_image" }));
+        // Brand solid background
+        coverPage.drawRectangle({ x: 0, y: 0, width: PAGE.width, height: PAGE.height, color: C.brandBlueDark });
+        // Diagonal accent stripe
+        coverPage.drawLine({ start: { x: 0, y: 220 }, end: { x: PAGE.width, y: 320 }, thickness: 80, color: C.brandBlue, opacity: 0.5 });
+        coverPage.drawLine({ start: { x: 0, y: 160 }, end: { x: PAGE.width, y: 260 }, thickness: 2, color: C.accent, opacity: 0.6 });
+      }
+
+      // Bottom brand panel
+      coverPage.drawRectangle({ x: 0, y: 0, width: PAGE.width, height: 220, color: rgb(0.06, 0.12, 0.24), opacity: 0.94 });
+
+      // Accent rule
+      coverPage.drawRectangle({ x: SP.margin, y: 185, width: 48, height: 3, color: C.accent });
+
+      // Title
+      const titleLines = wrapText(title, bold, TY.display, PAGE.width - SP.margin * 2);
+      let ty2 = 178;
+      for (const line of titleLines) {
+        coverPage.drawText(line, { x: SP.margin, y: ty2, size: TY.display, font: bold, color: C.white });
+        ty2 -= TY.display + 6;
+      }
+
+      // Address
+      if (address !== "—") {
+        coverPage.drawText(truncateToWidth(address, font, TY.h3, PAGE.width - SP.margin * 2), {
+          x: SP.margin, y: ty2 - 4, size: TY.h3, font, color: C.accent,
+        });
+        ty2 -= 20;
+      }
+
+      // Date + ID
+      coverPage.drawText(`${reportDate}  ·  ID: ${inspectionId.slice(0, 8).toUpperCase()}`, {
+        x: SP.margin, y: ty2 - 4, size: TY.bodySmall, font, color: rgb(0.6, 0.72, 0.88),
+      });
+
+      // Logo top-right
+      if (logoImage) {
+        const lw = 100; const lh = 50;
+        const { width: lfw, height: lfh } = fitImage(logoImage, lw, lh);
+        coverPage.drawImage(logoImage, { x: PAGE.width - SP.margin - lfw, y: PAGE.height - 14 - lfh, width: lfw, height: lfh });
+      }
+
+      // Company name top-left
+      coverPage.drawText("4 ELEMENTS RENOVATIONS", {
+        x: SP.margin, y: PAGE.height - 28, size: TY.bodySmall, font: bold, color: rgb(0.75, 0.86, 0.98),
+      });
+
+      // Intro text if builder
+      if (builderCover?.intro?.trim()) {
+        const introLines = wrapText(builderCover.intro, font, TY.bodySmall, PAGE.width - SP.margin * 2);
+        let iy = 22;
+        for (const line of introLines.slice(0, 3)) {
+          coverPage.drawText(line, { x: SP.margin, y: iy, size: TY.bodySmall, font, color: rgb(0.6, 0.72, 0.88) });
+          iy -= 12;
+        }
       }
     }
 
-    summaryPage.drawText(title, {
-      x: MARGIN + 12,
-      y: PAGE_HEIGHT - 76,
-      size: 20,
-      font: bold,
-      color: rgb(0.09, 0.15, 0.28),
-    });
-    summaryPage.drawText(`Inspection ID: ${inspectionId}`, {
-      x: MARGIN + 12,
-      y: PAGE_HEIGHT - 95,
-      size: 9,
-      font,
-      color: rgb(0.32, 0.32, 0.32),
-    });
-    summaryPage.drawText(`Generated: ${formatDateTime(new Date())}`, {
-      x: MARGIN + 12,
-      y: PAGE_HEIGHT - 108,
-      size: 9,
-      font,
-      color: rgb(0.32, 0.32, 0.32),
-    });
+    // ── Create layout context (starts on page 2 = summary) ─────────────────────
+    const ctx = createPdfContext({ doc, font, bold, logoBytes, title });
 
-    let cursorY = PAGE_HEIGHT - 154;
-    const contentWidth = PAGE_WIDTH - MARGIN * 2;
+    // ── SUMMARY PAGE ───────────────────────────────────────────────────────────
+    {
+      // Title block
+      ctx.page.drawRectangle({ x: SP.margin, y: ctx.y - 48, width: PAGE.width - SP.margin * 2, height: 52, color: C.surface, borderColor: C.divider, borderWidth: 0.6 });
+      if (logoImage) {
+        const { width: lw, height: lh } = fitImage(logoImage, 80, 38);
+        ctx.page.drawImage(logoImage, { x: PAGE.width - SP.margin - lw - 8, y: ctx.y - 44, width: lw, height: lh });
+      }
+      ctx.page.drawText(title, { x: SP.margin + 12, y: ctx.y - 18, size: TY.h1, font: bold, color: C.brandBlue });
+      ctx.page.drawText(`Inspection ID: ${inspectionId}  ·  ${reportDate}`, { x: SP.margin + 12, y: ctx.y - 34, size: TY.caption, font, color: C.muted });
+      ctx.y -= 64;
 
-    const drawHeader = (label: string) => {
-      summaryPage.drawText(label, {
-        x: MARGIN,
-        y: cursorY,
-        size: 12,
-        font: bold,
-        color: rgb(0.11, 0.19, 0.31),
+      const half = (PAGE.width - SP.margin * 2 - 12) / 2;
+
+      // Left column: homeowner + claim info
+      const leftX = SP.margin;
+      const leftY = ctx.y;
+
+      ctx.sectionRule("Property & Claim");
+      ctx.labelValue("Homeowner", homeownerName);
+      ctx.labelValue("Address", address);
+      ctx.labelValue("Phone", toDisplay(payload.phone ?? homeowner.phone));
+      ctx.labelValue("Claim #", claimNumber);
+      ctx.labelValue("Insurance", insuranceCarrier);
+      ctx.labelValue("Adjuster", toDisplay(payload.adjuster ?? homeowner.adjuster));
+      ctx.labelValue("Inspector", toDisplay(payload.inspectorName ?? homeowner.inspectorName));
+
+      const afterLeft = ctx.y;
+      ctx.y = leftY; // Reset to render right column in parallel
+
+      // Right column: section conditions matrix
+      const rightX = leftX + half + 12;
+      const condSections: Array<[string, string]> = [
+        ["roof", "Roof"],
+        ["siding", "Siding"],
+        ["gutters", "Gutters"],
+        ["windows", "Windows"],
+        ["interior", "Interior"],
+        ["attic", "Attic"],
+        ["perimeter", "Perimeter"],
+      ];
+
+      ctx.page.drawText("SECTION CONDITIONS", {
+        x: rightX, y: ctx.y - 2, size: TY.caption, font: bold, color: C.muted,
       });
-      cursorY -= 16;
-    };
-
-    const drawLine = (label: string, value: unknown) => {
-      cursorY = drawWrappedText(summaryPage, `${label}: ${toDisplay(value)}`, {
-        x: MARGIN,
-        y: cursorY,
-        maxWidth: contentWidth - 220,
-        font,
-        size: 10,
-        lineHeight: 13,
-        color: rgb(0.12, 0.12, 0.12),
-      });
-      cursorY -= 2;
-    };
-
-    // ── Section conditions helper ────────────────────────────────────────────
-    function drawConditionBadge(page: PDFPage, condition: string, x: number, y: number) {
-      const conditionColors: Record<string, [number, number, number]> = {
-        good:        [0.18, 0.54, 0.28],
-        damaged:     [0.75, 0.19, 0.18],
-        missing:     [0.84, 0.70, 0.47],
-        not_visible: [0.42, 0.44, 0.46],
-      };
-      const c = conditionColors[condition] ?? [0.42, 0.44, 0.46];
-      page.drawRectangle({ x, y: y - 3, width: 64, height: 13, color: rgb(c[0], c[1], c[2]) });
-      page.drawText(condition.replace(/_/g, " ").toUpperCase(), {
-        x: x + 4, y: y - 1, size: 7, font: bold, color: rgb(1, 1, 1),
-      });
-    }
-
-    if (builderSections) {
-      // ── v3: render visible sections from builder ─────────────────────────
-      for (const bs of builderSections.filter((s) => s.visible)) {
-        if (cursorY < 80) break;
-        drawHeader(bs.title || bs.key);
-
-        // Condition badge if section has a condition stored in sectionConditions
-        const cond = (payload.sectionConditions ?? {})[bs.key];
+      ctx.page.drawLine({ start: { x: rightX, y: ctx.y - 6 }, end: { x: rightX + half, y: ctx.y - 6 }, thickness: 0.5, color: C.divider });
+      let condY = ctx.y - 20;
+      for (const [key, label] of condSections) {
+        const cond = sectionConditions[key];
+        ctx.page.drawText(label, { x: rightX, y: condY, size: TY.bodySmall, font, color: C.body });
         if (cond) {
-          drawConditionBadge(summaryPage, cond, MARGIN + contentWidth - 80, cursorY + 14);
+          ctx.conditionBadge(cond, rightX + 80, condY);
+        } else {
+          ctx.page.drawText("—", { x: rightX + 80, y: condY, size: TY.bodySmall, font, color: C.light });
         }
-
-        // Special content for known sections
-        if (bs.key === "roof_overview" || bs.key === "roof") {
-          drawLine("Shingle Length (in)", roofOverview.shingleLengthInches);
-          drawLine("Shingle Width (in)", roofOverview.shingleWidthInches);
-          drawLine("Drip Edge Present", roofOverview.dripEdgePresent);
-        } else if (bs.key === "roof_damage" || bs.key === "damage") {
-          // Test square table
-          if (testSquares.length > 0) {
-            cursorY -= 4;
-            summaryPage.drawText("Test Squares:", { x: MARGIN, y: cursorY, size: 9, font: bold, color: rgb(0.18, 0.18, 0.22) });
-            cursorY -= 13;
-            for (const ts of testSquares) {
-              if (cursorY < 80) break;
-              const line = `  ${ts.slope ? ts.slope.toUpperCase() : "ANY"} slope — ${ts.hitCount ?? "?"} hits${ts.note ? ` (${ts.note})` : ""}`;
-              cursorY = drawWrappedText(summaryPage, line, { x: MARGIN + 8, y: cursorY, maxWidth: contentWidth - 230, font, size: 9, lineHeight: 12, color: rgb(0.2, 0.2, 0.24) });
-              cursorY -= 2;
-            }
-          }
-        } else if ((bs.key === "interior" || bs.key === "interior_attic") && Object.keys(interiorAttic).length > 0) {
-          drawLine("Interior Status", interiorAttic.interiorStatus);
-          drawLine("Attic Status", interiorAttic.atticStatus);
-        }
-        cursorY -= 4;
+        condY -= SP.lineSmall + 2;
       }
 
-      // Closing notes
-      const closingNotes = builderClosing?.notes?.trim() ?? "";
-      if (closingNotes.length > 0) {
-        if (cursorY >= 80) {
-          drawHeader("Closing Notes");
-          cursorY = drawWrappedText(summaryPage, closingNotes, { x: MARGIN, y: cursorY, maxWidth: contentWidth - 220, font, size: 10, lineHeight: 13 });
-        }
-      }
-    } else {
-      // ── v2 legacy section rendering ──────────────────────────────────────
-      if (sections.homeowner !== false) {
-        drawHeader("Homeowner");
-        drawLine("Name", homeowner.homeownerName);
-        drawLine("Phone", homeowner.phone);
-        drawLine("Email", homeowner.email);
-        cursorY -= 4;
-      }
+      ctx.y = Math.min(afterLeft, condY) - 8;
+    }
 
-      if (sections.roofOverview !== false) {
-        drawHeader("Roof Overview");
-        drawLine("Shingle Length (in)", roofOverview.shingleLengthInches);
-        drawLine("Shingle Width (in)", roofOverview.shingleWidthInches);
-        drawLine("Drip Edge Present", roofOverview.dripEdgePresent);
-        cursorY -= 4;
-      }
+    // ── ROOF SUMMARY ───────────────────────────────────────────────────────────
+    {
+      ctx.sectionRule("Roof Overview");
+      const shingleL = toDisplay(payload.shingleLengthInches ?? (roofOverview.shingleLengthInches));
+      const shingleW = toDisplay(payload.shingleWidthInches ?? (roofOverview.shingleWidthInches));
+      ctx.labelValue("Shingle Dimensions", shingleL !== "—" && shingleW !== "—" ? `${shingleL}" × ${shingleW}"` : "—");
+      ctx.labelValue("Estimated Age", payload.estimatedRoofAgeYears != null ? `${payload.estimatedRoofAgeYears} yrs` : toDisplay(roofOverview.estimatedRoofAgeYears));
+      ctx.labelValue("Layer Count", toDisplay(payload.layerCount ?? roofOverview.layerCount));
+      ctx.labelValue("Drip Edge", toDisplay(payload.dripEdgePresent ?? roofOverview.dripEdgePresent));
 
-      if (sections.interiorAttic === true) {
-        drawHeader("Interior + Attic");
-        drawLine("Interior Status", interiorAttic.interiorStatus);
-        drawLine("Interior Skip Reason", interiorAttic.interiorSkipReason);
-        drawLine("Attic Status", interiorAttic.atticStatus);
-        drawLine("Attic Skip Reason", interiorAttic.atticSkipReason);
-        cursorY -= 4;
-      }
-
-      // Test squares (v3 data embedded in v2 call)
       if (testSquares.length > 0) {
-        drawHeader("Hail Test Squares");
-        for (const ts of testSquares) {
-          if (cursorY < 80) break;
-          const line = `${ts.slope ? ts.slope.toUpperCase() : "ANY"} slope — ${ts.hitCount ?? "?"} strikes${ts.note ? ` · ${ts.note}` : ""}`;
-          cursorY = drawWrappedText(summaryPage, line, { x: MARGIN, y: cursorY, maxWidth: contentWidth - 220, font, size: 10, lineHeight: 13, color: rgb(0.12, 0.12, 0.12) });
-          cursorY -= 2;
-        }
-        cursorY -= 4;
-      }
-
-      const notes = typeof payload.notes === "string" ? payload.notes.trim() : "";
-      if (notes.length > 0) {
-        drawHeader("Summary Notes");
-        cursorY = drawWrappedText(summaryPage, notes, {
-          x: MARGIN,
-          y: cursorY,
-          maxWidth: contentWidth - 220,
-          font,
-          size: 10,
-          lineHeight: 13,
+        ctx.spacer(4);
+        ctx.subheading("Test Squares");
+        ctx.table({
+          columns: [
+            { header: "Slope", width: 80 },
+            { header: "Hit Count", width: 80 },
+            { header: "Note", width: PAGE.width - SP.margin * 2 - 160 },
+          ],
+          rows: testSquares.map((ts) => [
+            ts.slope ? ts.slope.charAt(0).toUpperCase() + ts.slope.slice(1) : "Any",
+            ts.hitCount != null ? String(ts.hitCount) : "—",
+            ts.note || "—",
+          ]),
         });
       }
     }
 
-    if (sections.signature !== false) {
-      const signatureX = PAGE_WIDTH - MARGIN - 192;
-      const signatureY = Math.max(84, cursorY - 10);
-      const signatureWidth = 192;
-      const signatureHeight = 118;
+    // ── ROOF COMPONENTS PAGE ───────────────────────────────────────────────────
+    {
+      const notedKeys = Object.entries(componentPresence)
+        .map(([key, raw]) => ({
+          key,
+          item: migrateComponentItem(raw as Record<string, unknown>),
+        }))
+        .filter(({ item }) => item.status === "present");
 
-      summaryPage.drawRectangle({
-        x: signatureX,
-        y: signatureY,
-        width: signatureWidth,
-        height: signatureHeight,
-        color: rgb(0.98, 0.98, 0.99),
-        borderColor: rgb(0.84, 0.84, 0.88),
-        borderWidth: 1,
-      });
-      summaryPage.drawText("Rep Signature", {
-        x: signatureX + 10,
-        y: signatureY + signatureHeight - 16,
-        size: 10,
-        font: bold,
-        color: rgb(0.16, 0.16, 0.2),
-      });
+      if (notedKeys.length > 0) {
+        ctx.addPage();
+        ctx.heading("Roof Components", TY.h1);
+        ctx.spacer(4);
 
-      const signatureName = toDisplay(signature.signatureRepName);
-      summaryPage.drawText(`By: ${truncateToWidth(signatureName, font, 8.5, signatureWidth - 20)}`, {
-        x: signatureX + 10,
-        y: signatureY + 12,
-        size: 8.5,
-        font,
-        color: rgb(0.33, 0.33, 0.33),
-      });
-      summaryPage.drawText(`At: ${formatDateTime(new Date())}`, {
-        x: signatureX + 10,
-        y: signatureY + 2,
-        size: 7.5,
-        font,
-        color: rgb(0.42, 0.42, 0.42),
-      });
+        for (const group of ROOF_COMPONENT_GROUP_ORDER) {
+          const groupItems = notedKeys.filter(({ key }) => ROOF_COMPONENT_BY_KEY.get(key)?.group === group);
+          if (groupItems.length === 0) continue;
 
+          ctx.sectionRule(ROOF_COMPONENT_GROUP_LABELS[group]);
+          ctx.table({
+            columns: [
+              { header: "Component", width: 180 },
+              { header: "Qty", width: 60 },
+              { header: "Condition", width: 80 },
+              { header: "Note", width: PAGE.width - SP.margin * 2 - 320 },
+            ],
+            rows: groupItems.map(({ key, item }) => {
+              const def = ROOF_COMPONENT_BY_KEY.get(key);
+              const label = def?.label ?? key.replace(/_/g, " ");
+              const qty = item.quantity != null ? `${item.quantity}${def?.qtyUnit ? ` ${def.qtyUnit}` : ""}` : "—";
+              const cond = item.condition ? item.condition.charAt(0).toUpperCase() + item.condition.slice(1) : "—";
+              return [label, qty, cond, item.note?.trim() || "—"];
+            }),
+          });
+        }
+      }
+    }
+
+    // ── SECTION DETAIL PAGES ───────────────────────────────────────────────────
+    const hubSections: Array<[string, string]> = [
+      ["roof", "Roof"], ["siding", "Siding"], ["gutters", "Gutters"],
+      ["windows", "Windows"], ["interior", "Interior"], ["attic", "Attic"], ["perimeter", "Perimeter"],
+    ];
+
+    const hasAnySection = hubSections.some(([key]) => sectionConditions[key] || sectionNotes[key]);
+    if (hasAnySection) {
+      ctx.addPage();
+      ctx.heading("Section Details", TY.h1);
+      for (const [key, label] of hubSections) {
+        const cond = sectionConditions[key];
+        const note = sectionNotes[key]?.trim();
+        if (!cond && !note) continue;
+
+        ctx.ensureSpace(50);
+        ctx.spacer(6);
+        // Section name + condition badge inline
+        ctx.page.drawText(label, { x: SP.margin, y: ctx.y, size: TY.h2, font: bold, color: C.brandBlue });
+        if (cond) {
+          const bw = ctx.conditionBadge(cond, SP.margin + bold.widthOfTextAtSize(label, TY.h2) + 10, ctx.y);
+          void bw;
+        }
+        ctx.y -= TY.h2 + 6;
+        ctx.page.drawLine({ start: { x: SP.margin, y: ctx.y }, end: { x: PAGE.width - SP.margin, y: ctx.y }, thickness: 0.4, color: C.divider });
+        ctx.y -= 8;
+        if (note) {
+          ctx.paragraph(note);
+        }
+        ctx.spacer(4);
+      }
+    }
+
+    // Closing notes
+    const closingNotes = builderClosing?.notes?.trim() ?? (typeof payload.notes === "string" ? payload.notes.trim() : "");
+    if (closingNotes) {
+      ctx.ensureSpace(40);
+      ctx.sectionRule("Closing Notes");
+      ctx.paragraph(closingNotes);
+    }
+
+    // ── SIGNATURE ─────────────────────────────────────────────────────────────
+    {
       const signaturePath =
-        typeof signature.signaturePath === "string" && signature.signaturePath.trim().length > 0
+        typeof signature.signaturePath === "string" && signature.signaturePath.trim()
           ? signature.signaturePath.trim()
           : null;
+      const signatureRepName = toDisplay(signature.signatureRepName);
 
-      if (signaturePath) {
-        const signatureDl = await supabase.storage.from("rep-signatures").download(signaturePath);
-        if (!signatureDl.error && signatureDl.data) {
-          const signatureBytes = new Uint8Array(await signatureDl.data.arrayBuffer());
-          const signatureImage = await embedImage(doc, signatureBytes, "image/png", "signature.png");
-          if (signatureImage) {
-            drawImageFit(summaryPage, signatureImage, {
-              x: signatureX + 8,
-              y: signatureY + 26,
-              width: signatureWidth - 16,
-              height: signatureHeight - 44,
-            });
-          } else {
-            summaryPage.drawText("Signature image unavailable", {
-              x: signatureX + 10,
-              y: signatureY + 54,
-              size: 8,
-              font,
-              color: rgb(0.5, 0.3, 0.3),
-            });
+      if (signaturePath || signatureRepName !== "—") {
+        ctx.ensureSpace(140);
+        const sigX = PAGE.width - SP.margin - 192;
+        const sigY = ctx.y - 120;
+        ctx.page.drawRectangle({ x: sigX, y: sigY, width: 192, height: 120, color: C.surface, borderColor: C.divider, borderWidth: 0.6 });
+        ctx.page.drawText("Inspector Signature", { x: sigX + 10, y: sigY + 108, size: TY.bodySmall, font: bold, color: C.brandBlue });
+        ctx.page.drawText(`By: ${truncateToWidth(signatureRepName, font, TY.caption, 172)}`, { x: sigX + 10, y: sigY + 14, size: TY.caption, font, color: C.muted });
+        ctx.page.drawText(`Date: ${reportDate}`, { x: sigX + 10, y: sigY + 5, size: TY.caption, font, color: C.muted });
+
+        if (signaturePath) {
+          const dl = await supabase.storage.from("rep-signatures").download(signaturePath);
+          if (!dl.error && dl.data) {
+            const bytes = new Uint8Array(await dl.data.arrayBuffer());
+            const img = await embedImage(doc, bytes, "image/png", "signature.png");
+            if (img) {
+              const { width: w, height: h } = fitImage(img, 172, 76);
+              ctx.page.drawImage(img, { x: sigX + (192 - w) / 2, y: sigY + 26, width: w, height: h });
+            }
           }
         } else {
-          summaryPage.drawText("Signature not found", {
-            x: signatureX + 10,
-            y: signatureY + 54,
-            size: 8,
-            font,
-            color: rgb(0.5, 0.3, 0.3),
-          });
-          if (signatureDl.error) {
-            console.warn(
-              JSON.stringify({ event: "inspection_pdf_signature_download_failed", reason: signatureDl.error.message }),
-            );
-          }
+          ctx.page.drawText("(no signature captured)", { x: sigX + 10, y: sigY + 60, size: TY.caption, font, color: C.light });
         }
-      } else {
-        summaryPage.drawText("No signature selected", {
-          x: signatureX + 10,
-          y: signatureY + 54,
-          size: 8,
-          font,
-          color: rgb(0.45, 0.45, 0.45),
-        });
+        ctx.y -= 134;
       }
     }
 
-    const galleryRows = limitedRows;
-    const unsupportedPhotos: string[] = [];
+    // ── PERSONAL PROPERTY ─────────────────────────────────────────────────────
+    const personalProperty = Array.isArray(payload.personalProperty) ? payload.personalProperty : [];
+    const documentedPPRooms = personalProperty.filter((r) => r && (Array.isArray(r.photoIds) ? r.photoIds.length > 0 : false) || (r?.note ?? "").trim().length > 0);
+    if (documentedPPRooms.length > 0) {
+      ctx.addPage();
+      ctx.sectionRule("Personal Property");
+      ctx.paragraph("Damaged contents flagged by room. Photos and damage causes are recorded for each room below.");
+      ctx.spacer(8);
 
-    type EmbeddedRow = { row: InspectionPhotoRow; image: PDFImage };
-    const embeddedRows: EmbeddedRow[] = [];
-    for (let start = 0; start < galleryRows.length; start += PHOTO_EMBED_BATCH_SIZE) {
-      const batch = galleryRows.slice(start, start + PHOTO_EMBED_BATCH_SIZE);
-      const batchResults = await Promise.all(
-        batch.map(async (row) => {
+      const PP_LABELS: Record<string, string> = {
+        living_room: "Living Room",
+        dining_room: "Dining Room",
+        kitchen: "Kitchen",
+        master_bedroom: "Master Bedroom",
+        bedroom_2: "Bedroom 2",
+        bedroom_3: "Bedroom 3",
+        bathroom: "Bathroom",
+        office: "Office",
+        basement: "Basement",
+      };
+
+      for (const room of documentedPPRooms) {
+        const label = room.key.startsWith("custom:") ? (room.customLabel || "Custom Room") : (PP_LABELS[room.key] ?? room.key);
+        ctx.ensureSpace(40);
+        ctx.heading(label, TY.h2);
+        if (room.damageCause && room.damageCause !== "none") {
+          ctx.labelValue("Damage Cause", room.damageCause.charAt(0).toUpperCase() + room.damageCause.slice(1));
+        }
+        ctx.labelValue("Photos", String((room.photoIds ?? []).length));
+        if ((room.note ?? "").trim()) {
+          ctx.spacer(4);
+          ctx.paragraph(room.note.trim());
+        }
+        ctx.spacer(10);
+      }
+    }
+
+    // ── EXTERIOR COLLATERAL ───────────────────────────────────────────────────
+    const exteriorCollateral = Array.isArray(payload.exteriorCollateral) ? payload.exteriorCollateral : [];
+    if (exteriorCollateral.length > 0) {
+      ctx.addPage();
+      ctx.sectionRule("Exterior Collateral");
+      ctx.paragraph("Items outside the home damaged or affected by the storm event. Each line item is itemized for the carrier.");
+      ctx.spacer(8);
+
+      ctx.table({
+        columns: [
+          { header: "Type", width: 180 },
+          { header: "Condition", width: 90 },
+          { header: "Cause", width: 80 },
+          { header: "Photos", width: 50 },
+        ],
+        rows: exteriorCollateral.map((it) => [
+          collateralLabel(it.type, it.customTypeLabel) || "—",
+          it.condition ? it.condition.charAt(0).toUpperCase() + it.condition.slice(1) : "—",
+          it.damageCause && it.damageCause !== "none" ? it.damageCause : "—",
+          String((it.photoIds ?? []).length),
+        ]),
+      });
+      ctx.spacer(10);
+
+      // Per-item detail blocks for items with notes
+      const itemsWithDetail = exteriorCollateral.filter((it) => (it.note ?? "").trim());
+      if (itemsWithDetail.length > 0) {
+        ctx.subheading("Notes");
+        for (const it of itemsWithDetail) {
+          ctx.ensureSpace(30);
+          ctx.heading(collateralLabel(it.type, it.customTypeLabel), TY.h3);
+          if (it.note) ctx.paragraph(it.note.trim());
+          ctx.spacer(6);
+        }
+      }
+    }
+
+    // ── DETACHED STRUCTURES ───────────────────────────────────────────────────
+    const detachedBuildings = Array.isArray(payload.detachedBuildings) ? payload.detachedBuildings : [];
+    const submittedBuildings = detachedBuildings.filter((b) => b && b.submitted);
+    for (const b of submittedBuildings) {
+      const title = b.label === "other" && b.customLabel ? b.customLabel : b.label.charAt(0).toUpperCase() + b.label.slice(1);
+      const sectionEntries = Object.entries(b.sections ?? {}).filter(([, s]) => s?.condition || (s?.note ?? "").trim());
+      const ppRooms = (b.personalProperty ?? []).filter((r) => (r.photoIds ?? []).length > 0 || (r.note ?? "").trim());
+      const ecItems = b.exteriorCollateral ?? [];
+      if (sectionEntries.length === 0 && ppRooms.length === 0 && ecItems.length === 0) continue;
+
+      ctx.addPage();
+      ctx.sectionRule(`Detached: ${title}`);
+      ctx.labelValue("Type", b.label.toUpperCase());
+      if (b.completedAt) ctx.labelValue("Status", "Completed");
+      ctx.labelValue("Photos", String((b.photoIds ?? []).length));
+      ctx.spacer(10);
+
+      const SECTION_LABELS: Record<string, string> = {
+        roof: "Roof", siding: "Siding", gutters: "Gutters", windows: "Windows",
+        interior: "Interior", attic: "Attic", perimeter: "Perimeter",
+      };
+
+      for (const [key, st] of sectionEntries) {
+        ctx.ensureSpace(30);
+        ctx.heading(SECTION_LABELS[key] ?? key.charAt(0).toUpperCase() + key.slice(1), TY.h3);
+        if (st?.condition) {
+          const w = ctx.conditionBadge(st.condition, SP.margin, ctx.y);
+          ctx.spacer(16);
+        }
+        if ((st?.note ?? "").trim()) {
+          ctx.paragraph(st.note.trim());
+        }
+        ctx.spacer(6);
+      }
+
+      if (ppRooms.length > 0) {
+        ctx.ensureSpace(24);
+        ctx.subheading("Contents");
+        for (const r of ppRooms) {
+          const lbl = r.key.startsWith("custom:") ? (r.customLabel || "Custom") : r.key.replace(/_/g, " ");
+          ctx.paragraph(`• ${lbl}${(r.note ?? "").trim() ? ` — ${r.note.trim()}` : ""}`);
+        }
+        ctx.spacer(6);
+      }
+
+      if (ecItems.length > 0) {
+        ctx.ensureSpace(24);
+        ctx.subheading("Collateral Items");
+        for (const it of ecItems) {
+          const lbl = collateralLabel(it.type, it.customTypeLabel);
+          const cond = it.condition ? ` (${it.condition})` : "";
+          ctx.paragraph(`• ${lbl}${cond}${(it.note ?? "").trim() ? ` — ${it.note.trim()}` : ""}`);
+        }
+        ctx.spacer(6);
+      }
+    }
+
+    // ── PHOTO GALLERY ─────────────────────────────────────────────────────────
+    if (limitedRows.length > 0) {
+      const unsupportedPhotos: string[] = [];
+      type EmbeddedRow = { row: InspectionPhotoRow; image: PDFImage | null };
+      const embeddedRows: EmbeddedRow[] = [];
+
+      for (let start = 0; start < limitedRows.length; start += PHOTO_EMBED_BATCH_SIZE) {
+        const batch = limitedRows.slice(start, start + PHOTO_EMBED_BATCH_SIZE);
+        const results = await Promise.all(batch.map(async (row) => {
           const dl = await supabase.storage.from("inspection-media").download(row.file_path);
           if (dl.error || !dl.data) {
-            return { row, image: null as PDFImage | null, unsupported: true };
+            console.warn(JSON.stringify({ event: "pdf_photo_download_failed", file: row.file_name, error: dl.error?.message }));
+            return { row, image: null };
           }
           const bytes = new Uint8Array(await dl.data.arrayBuffer());
           const image = await embedImage(doc, bytes, row.content_type, row.file_name);
-          return { row, image, unsupported: !image };
-        }),
-      );
+          if (!image) unsupportedPhotos.push(row.file_name);
+          return { row, image };
+        }));
+        embeddedRows.push(...results);
+      }
 
-      for (const result of batchResults) {
-        if (result.unsupported || !result.image) {
-          unsupportedPhotos.push(result.row.file_name);
-          continue;
+      // 2-column, 3-row grid = 6 photos per page
+      const COLS = 2;
+      const ROWS = 3;
+      const PER_PAGE = COLS * ROWS;
+      const GAP_X = 12;
+      const GAP_Y = 10;
+      const tileW = (PAGE.width - SP.margin * 2 - GAP_X * (COLS - 1)) / COLS;
+      const IMG_H = 156;
+      const CAP_H = 28;
+      const TILE_H = IMG_H + CAP_H + 4;
+      const TOP_Y = PAGE.height - SP.margin - 24;
+
+      const totalGalleryPages = Math.ceil(embeddedRows.length / PER_PAGE);
+
+      for (let pi = 0; pi < embeddedRows.length; pi += PER_PAGE) {
+        const chunk = embeddedRows.slice(pi, pi + PER_PAGE);
+        const galleryPage = doc.addPage([PAGE.width, PAGE.height]);
+
+        // Page chrome
+        galleryPage.drawRectangle({ x: 0, y: PAGE.height - 28, width: PAGE.width, height: 28, color: C.brandBlue });
+        galleryPage.drawText("4 Elements Renovations", { x: SP.margin, y: PAGE.height - 19, size: TY.bodySmall, font: bold, color: C.white });
+        const gpLabel = `Photo Gallery · ${pi / PER_PAGE + 1} of ${Math.max(1, totalGalleryPages)}`;
+        const gpw = font.widthOfTextAtSize(gpLabel, TY.caption);
+        galleryPage.drawText(gpLabel, { x: PAGE.width - SP.margin - gpw, y: PAGE.height - 19, size: TY.caption, font, color: rgb(0.75, 0.86, 0.98) });
+        galleryPage.drawRectangle({ x: 0, y: 0, width: PAGE.width, height: 22, color: C.brandBlueDark });
+        galleryPage.drawText("4 Elements Renovations · Inspection Report", { x: SP.margin, y: 7, size: TY.micro, font, color: rgb(0.6, 0.72, 0.88) });
+
+        for (let i = 0; i < chunk.length; i++) {
+          const col = i % COLS;
+          const row = Math.floor(i / COLS);
+          if (row >= ROWS) break;
+
+          const tileX = SP.margin + col * (tileW + GAP_X);
+          const tileTopY = TOP_Y - row * (TILE_H + GAP_Y);
+
+          galleryPage.drawRectangle({ x: tileX, y: tileTopY - TILE_H, width: tileW, height: TILE_H, color: C.white, borderColor: C.divider, borderWidth: 0.6 });
+
+          const { row: photoRow, image } = chunk[i];
+
+          if (image) {
+            const { width: iw, height: ih } = fitImage(image, tileW - 4, IMG_H - 4);
+            const ix = tileX + (tileW - iw) / 2;
+            galleryPage.drawImage(image, { x: ix, y: tileTopY - 2 - ih, width: iw, height: ih });
+          } else {
+            galleryPage.drawRectangle({ x: tileX + 2, y: tileTopY - IMG_H - 2, width: tileW - 4, height: IMG_H - 4, color: C.surface });
+            galleryPage.drawText("Photo unavailable", { x: tileX + 8, y: tileTopY - IMG_H / 2 - 6, size: TY.caption, font, color: C.muted });
+          }
+
+          // Caption area
+          const captionY = tileTopY - IMG_H - 4;
+          galleryPage.drawRectangle({ x: tileX, y: captionY - CAP_H, width: tileW, height: CAP_H, color: C.surface });
+          const sectionText = truncateToWidth(humanSection(photoRow.capture_section), bold, TY.caption, tileW - 8);
+          galleryPage.drawText(sectionText, { x: tileX + 4, y: captionY - 11, size: TY.caption, font: bold, color: C.brandBlue });
+          const tags = extractPhotoTags(photoRow);
+          const tagText = tags.length > 0 ? tags.join(" · ") : "";
+          if (tagText) {
+            galleryPage.drawText(truncateToWidth(tagText, font, TY.micro, tileW - 8), { x: tileX + 4, y: captionY - 22, size: TY.micro, font, color: C.muted });
+          }
         }
-        embeddedRows.push({ row: result.row, image: result.image });
       }
-    }
 
-    const chunkSize = 8;
-    const totalGalleryPages = Math.ceil(embeddedRows.length / chunkSize);
-    for (let i = 0; i < embeddedRows.length; i += chunkSize) {
-      const chunk = embeddedRows.slice(i, i + chunkSize);
-      const page = doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-      const galleryPageIndex = i / chunkSize + 1;
-
-      page.drawText(`Photo Gallery ${galleryPageIndex}/${Math.max(1, totalGalleryPages)}`, {
-        x: MARGIN,
-        y: PAGE_HEIGHT - MARGIN,
-        size: 14,
-        font: bold,
-        color: rgb(0.11, 0.19, 0.31),
-      });
-
-      const cols = 4;
-      const rows = 2;
-      const gapX = 10;
-      const gapY = 18;
-      const tileWidth = (PAGE_WIDTH - MARGIN * 2 - gapX * (cols - 1)) / cols;
-      const tileHeight = 146;
-      const imageHeight = 112;
-      const topY = PAGE_HEIGHT - 74;
-
-      for (let index = 0; index < chunk.length; index += 1) {
-        const col = index % cols;
-        const rowIndex = Math.floor(index / cols);
-        if (rowIndex >= rows) break;
-
-        const tileX = MARGIN + col * (tileWidth + gapX);
-        const tileTopY = topY - rowIndex * (tileHeight + gapY);
-        const tileBottomY = tileTopY - tileHeight;
-
-        page.drawRectangle({
-          x: tileX,
-          y: tileBottomY,
-          width: tileWidth,
-          height: tileHeight,
-          borderColor: rgb(0.85, 0.87, 0.9),
-          borderWidth: 0.8,
-          color: rgb(1, 1, 1),
-        });
-
-        const { row: photoRow, image } = chunk[index];
-        drawImageFit(page, image, {
-          x: tileX + 5,
-          y: tileTopY - imageHeight - 5,
-          width: tileWidth - 10,
-          height: imageHeight,
-        });
-
-        const sectionText = truncateToWidth(sectionLabel(photoRow.capture_section), bold, 8.2, tileWidth - 10);
-        page.drawText(sectionText, {
-          x: tileX + 5,
-          y: tileBottomY + 20,
-          size: 8.2,
-          font: bold,
-          color: rgb(0.18, 0.18, 0.22),
-        });
-
-        const tags = extractPhotoTags(photoRow);
-        const tagText = tags.length > 0 ? tags.join(" | ") : "No tags";
-        page.drawText(truncateToWidth(tagText, font, 7.2, tileWidth - 10), {
-          x: tileX + 5,
-          y: tileBottomY + 9,
-          size: 7.2,
-          font,
-          color: rgb(0.38, 0.38, 0.42),
-        });
-      }
-    }
-
-    if (unsupportedPhotos.length > 0 || omittedPhotoCount > 0) {
-      const appendix = doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-      appendix.drawText("Photos Not Embedded", {
-        x: MARGIN,
-        y: PAGE_HEIGHT - MARGIN,
-        size: 14,
-        font: bold,
-        color: rgb(0.42, 0.19, 0.16),
-      });
-
-      let y = PAGE_HEIGHT - MARGIN - 20;
-      if (omittedPhotoCount > 0) {
-        y = drawWrappedText(appendix, `- ${omittedPhotoCount} photo(s) omitted to keep PDF fast and uploadable.`, {
-          x: MARGIN,
-          y,
-          maxWidth: PAGE_WIDTH - MARGIN * 2,
-          font,
-          size: 9,
-          lineHeight: 12,
-          color: rgb(0.35, 0.35, 0.35),
-        });
-      }
-      for (const fileName of unsupportedPhotos) {
-        y = drawWrappedText(appendix, `- ${fileName}`, {
-          x: MARGIN,
-          y,
-          maxWidth: PAGE_WIDTH - MARGIN * 2,
-          font,
-          size: 9,
-          lineHeight: 12,
-          color: rgb(0.35, 0.35, 0.35),
-        });
-        if (y < 60) break;
+      // Omitted / unavailable notice
+      if (unsupportedPhotos.length > 0 || omittedCount > 0) {
+        const notePage = doc.addPage([PAGE.width, PAGE.height]);
+        notePage.drawRectangle({ x: 0, y: PAGE.height - 28, width: PAGE.width, height: 28, color: C.brandBlue });
+        notePage.drawText("Photo Notes", { x: SP.margin, y: PAGE.height - 19, size: TY.bodySmall, font: bold, color: C.white });
+        let ny = PAGE.height - SP.margin - 24;
+        if (omittedCount > 0) {
+          notePage.drawText(`${omittedCount} photo(s) omitted — PDF capped at ${MAX_REPORT_PHOTOS} for file size.`, { x: SP.margin, y: ny, size: TY.body, font, color: C.body });
+          ny -= SP.lineBody;
+        }
+        for (const fname of unsupportedPhotos.slice(0, 40)) {
+          notePage.drawText(`• ${fname} — could not be embedded`, { x: SP.margin, y: ny, size: TY.bodySmall, font, color: C.muted });
+          ny -= SP.lineSmall;
+          if (ny < 40) break;
+        }
       }
     }
 
@@ -840,14 +768,12 @@ export async function POST(request: NextRequest, context: RouteContext) {
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
-        "Content-Disposition": `inline; filename=\"${fileName}\"`,
+        "Content-Disposition": `inline; filename="${fileName}"`,
         "X-Report-File-Name": fileName,
       },
     });
   } catch (error) {
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : "Failed to generate inspection PDF." },
-      { status: 500 },
-    );
+    console.error(JSON.stringify({ event: "inspection_pdf_error", error: error instanceof Error ? error.message : String(error) }));
+    return NextResponse.json({ error: "Failed to generate report PDF." }, { status: 500 });
   }
 }

@@ -17,6 +17,8 @@ export type HubSectionKey =
   | "windows"
   | "interior"
   | "attic"
+  | "personal_property"
+  | "exterior_collateral"
   | "detached";
 
 // Roof sub-hub cards
@@ -63,23 +65,19 @@ export type InspectionPhotoDraft = {
 };
 
 // ── Component presence ────────────────────────────────────────────────────────
+export type ComponentStatus = "present" | "absent" | "unknown";
+export type ComponentCondition = "good" | "fair" | "poor";
+
 export type ComponentPresenceItem = {
-  present: boolean;
+  status: ComponentStatus;
   quantity: number | null;
+  condition: ComponentCondition | null;
+  note?: string;
+  /** Legacy compat — treat as status:"present" when migrating old data */
+  present?: boolean;
 };
 
 export type ComponentPresenceDraft = Record<string, ComponentPresenceItem>;
-
-export const COMPONENT_PRESENCE_KEYS = [
-  "drip_edge",
-  "flashing",
-  "soffit",
-  "fascia",
-  "chimney",
-  "skylight",
-  "vents",
-  "satellite_dish",
-];
 
 export const REQUIRED_PHOTO_COUNTS = {
   perimeterPhotos: 8,
@@ -89,7 +87,20 @@ export const REQUIRED_PHOTO_COUNTS = {
 } as const;
 
 export function defaultComponentPresenceDraft(): ComponentPresenceDraft {
-  return Object.fromEntries(COMPONENT_PRESENCE_KEYS.map((key) => [key, { present: false, quantity: null }]));
+  return {};
+}
+
+/** Migrate a legacy ComponentPresenceItem ({present, quantity}) to the new shape */
+export function migrateComponentItem(raw: Record<string, unknown>): ComponentPresenceItem {
+  if ("status" in raw) {
+    return raw as unknown as ComponentPresenceItem;
+  }
+  return {
+    status: raw.present === true ? "present" : raw.present === false ? "absent" : "unknown",
+    quantity: (raw.quantity as number | null) ?? null,
+    condition: null,
+    note: "",
+  };
 }
 
 // ── Roof damage / test squares ────────────────────────────────────────────────
@@ -109,6 +120,66 @@ export type RoofDamageMetrics = {
   testSquares: TestSquare[];
 };
 
+// ── Personal Property (room-flagged contents capture) ───────────────────────
+export type PersonalPropertyRoomKey =
+  | "living_room"
+  | "dining_room"
+  | "kitchen"
+  | "master_bedroom"
+  | "bedroom_2"
+  | "bedroom_3"
+  | "bathroom"
+  | "office"
+  | "basement"
+  | string; // custom rooms saved as `custom:<uuid>`
+
+export type PersonalPropertyRoom = {
+  id: string;
+  key: PersonalPropertyRoomKey;
+  customLabel?: string;
+  damageCause: DamageCause;
+  note: string;
+  photoIds: string[];
+};
+
+// ── Exterior Collateral (per-item subcards w/ taxonomy) ──────────────────────
+export type ExteriorCollateralType =
+  | "ac_condenser"
+  | "mini_split"
+  | "satellite_dish"
+  | "mailbox"
+  | "address_numbers"
+  | "shutters"
+  | "exterior_lights"
+  | "fence"
+  | "deck"
+  | "pergola"
+  | "awning"
+  | "screen_door"
+  | "gutter_section"
+  | "downspout"
+  | "chimney_cap"
+  | "vent_cover"
+  | "antenna"
+  | "solar_panel"
+  | "pool_cover"
+  | "grill"
+  | "patio_furniture"
+  | "yard_ornament"
+  | "hose_reel"
+  | "generator"
+  | "other";
+
+export type ExteriorCollateralItem = {
+  id: string;
+  type: ExteriorCollateralType;
+  customTypeLabel?: string;
+  condition: SectionCondition | null;
+  damageCause: DamageCause;
+  note: string;
+  photoIds: string[];
+};
+
 // ── Detached buildings ────────────────────────────────────────────────────────
 export type DetachedBuildingLabel = "shed" | "garage" | "barn" | "other";
 
@@ -116,6 +187,15 @@ export type DetachedBuilding = {
   id: string;
   label: DetachedBuildingLabel;
   customLabel?: string;
+  /** True after user presses Submit on the type card; opens its own hub. */
+  submitted?: boolean;
+  /** Per-section state, same shape as the main house hub. */
+  sections?: HubSectionStates;
+  /** Optional inhabited-building extras (e.g., garage apartment). */
+  personalProperty?: PersonalPropertyRoom[];
+  exteriorCollateral?: ExteriorCollateralItem[];
+  /** Photos linked to this building only. */
+  photoIds?: string[];
   completedAt: string | null;
 };
 
@@ -179,6 +259,8 @@ export type InspectionHubMetadata = {
   roofDamage: RoofDamageMetrics;
   sectionStates: HubSectionStates;
   detachedBuildings: DetachedBuilding[];
+  personalProperty: PersonalPropertyRoom[];
+  exteriorCollateral: ExteriorCollateralItem[];
   testSquares: TestSquare[];
   signatureId: string | null;
   signaturePath: string | null;

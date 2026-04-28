@@ -3,6 +3,7 @@
 import React, { useState } from "react";
 import type { HubSectionKey, SectionCondition, InspectionPhotoDraft, CaptureSection } from "@/types/inspection";
 import InAppCamera from "./InAppCamera";
+import PhotoGrid from "./PhotoGrid";
 
 type SectionConfig = {
   key: HubSectionKey;
@@ -58,12 +59,16 @@ export default function SectionDrawer({
       continuous: boolean;
       interimResults: boolean;
       onresult: ((e: { results: { [i: number]: { [j: number]: { transcript: string } }; length: number } }) => void) | null;
+      onerror: (() => void) | null;
       start: () => void;
       stop: () => void;
     };
     const win = window as unknown as Record<string, unknown>;
     const SR = (win["SpeechRecognition"] ?? win["webkitSpeechRecognition"]) as SpeechRecognitionCtor | undefined;
-    if (!SR) return;
+    if (!SR) {
+      alert("Voice notes are not supported in this browser.");
+      return;
+    }
     const rec = new SR();
     rec.continuous = true;
     rec.interimResults = true;
@@ -74,6 +79,9 @@ export default function SectionDrawer({
       }
       setVoiceTranscript(parts.join(" "));
     };
+    rec.onerror = () => {
+      stopVoice();
+    };
     rec.start();
     recognitionRef.current = rec;
     setVoiceRecording(true);
@@ -83,11 +91,15 @@ export default function SectionDrawer({
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     setVoiceRecording(false);
-    if (voiceTranscript) {
-      onNoteChange(note ? `${note}\n${voiceTranscript}` : voiceTranscript);
-      setVoiceTranscript("");
-    }
+    setVoiceTranscript((transcript) => {
+      if (transcript) {
+        onNoteChange(note ? `${note}\n${transcript}` : transcript);
+      }
+      return "";
+    });
   }
+
+  const [showDoneConfirm, setShowDoneConfirm] = useState(false);
 
   const photoCount = photos.length;
   const suggested = config.suggestedPhotoCount ?? 0;
@@ -117,10 +129,33 @@ export default function SectionDrawer({
             <button
               type="button"
               className={`section-complete-btn${manualComplete ? " active" : ""}`}
-              onClick={onToggleManualComplete}
+              onClick={() => {
+                if (!manualComplete && suggested > 0 && photoCount < suggested) {
+                  setShowDoneConfirm(true);
+                } else {
+                  onToggleManualComplete();
+                }
+              }}
             >
               {manualComplete ? "✓ Done" : "Mark Done"}
             </button>
+            {showDoneConfirm ? (
+              <div className="done-confirm-overlay" role="dialog" aria-modal="true" aria-label="Confirm mark done">
+                <div className="done-confirm-dialog">
+                  <p className="done-confirm-msg">
+                    Only {photoCount} of {suggested} suggested photos added. Mark done anyway?
+                  </p>
+                  <div className="done-confirm-actions">
+                    <button type="button" className="chip active" onClick={() => { setShowDoneConfirm(false); onToggleManualComplete(); }}>
+                      Mark Done
+                    </button>
+                    <button type="button" className="chip" onClick={() => setShowDoneConfirm(false)}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
             <button type="button" className="section-drawer__close" onClick={onClose} aria-label="Close">
               ✕
             </button>
@@ -156,32 +191,7 @@ export default function SectionDrawer({
         </div>
 
         {/* Photo grid */}
-        {photoCount > 0 ? (
-          <div className="section-drawer__photo-grid">
-            {photos.map((photo) => {
-              const url = URL.createObjectURL(photo.file);
-              return (
-                <div key={photo.id} className="section-drawer__photo-thumb">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={url} alt="" className="section-drawer__photo-img" />
-                  <button
-                    type="button"
-                    className="section-drawer__photo-remove"
-                    onClick={() => onRemovePhoto(photo.id)}
-                    aria-label="Remove photo"
-                  >
-                    ✕
-                  </button>
-                  {photo.slopeTag ? (
-                    <span className="section-drawer__photo-badge">{photo.slopeTag}</span>
-                  ) : null}
-                </div>
-              );
-            })}
-          </div>
-        ) : (
-          <p className="section-drawer__empty">No photos yet</p>
-        )}
+        <PhotoGrid photos={photos} onRemove={onRemovePhoto} />
 
         {/* Condition selector */}
         {!config.hideCondition ? (
@@ -213,23 +223,37 @@ export default function SectionDrawer({
           <div className="section-drawer__note-row">
             <textarea
               className="section-drawer__note-input"
-              value={note}
-              onChange={(e) => onNoteChange(e.target.value)}
+              value={voiceRecording && voiceTranscript ? `${note}${note ? "\n" : ""}${voiceTranscript}` : note}
+              onChange={(e) => !voiceRecording && onNoteChange(e.target.value)}
               placeholder="Add a section note…"
               rows={3}
+              readOnly={voiceRecording}
             />
-            <button
-              type="button"
-              className={`voice-btn${voiceRecording ? " recording" : ""}`}
-              onPointerDown={startVoice}
-              onPointerUp={stopVoice}
-              aria-label={voiceRecording ? "Stop recording" : "Hold to record voice note"}
-            >
-              🎤
-            </button>
+            {voiceRecording ? (
+              <button
+                type="button"
+                className="voice-btn recording"
+                onClick={stopVoice}
+                aria-label="Stop recording"
+              >
+                ⏹
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="voice-btn"
+                onClick={startVoice}
+                aria-label="Start voice note"
+              >
+                🎤
+              </button>
+            )}
           </div>
-          {voiceRecording && voiceTranscript ? (
-            <p className="voice-preview">{voiceTranscript}</p>
+          {voiceRecording ? (
+            <p className="voice-preview">
+              <span className="voice-listening-dot" />
+              Listening… {voiceTranscript ? `"${voiceTranscript.slice(0, 60)}${voiceTranscript.length > 60 ? "…" : ""}"` : ""}
+            </p>
           ) : null}
         </div>
       </div>

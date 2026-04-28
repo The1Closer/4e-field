@@ -25,9 +25,9 @@ import { getSupabaseBrowserClient } from "@/lib/supabase-browser";
 import { useAuthSession } from "@/lib/use-auth-session";
 import type { AreaSuggestion, SessionFeedback } from "@/types/field-intelligence";
 import {
-  COMPONENT_PRESENCE_KEYS,
   REQUIRED_PHOTO_COUNTS,
   defaultComponentPresenceDraft,
+  type ComponentPresenceItem,
   type CaptureSection,
   type DamageSlope,
   type DamageCause,
@@ -38,12 +38,20 @@ import {
   type HubSectionStates,
   type RoofDamageMetrics,
   type DetachedBuilding,
+  type DetachedBuildingLabel,
   type ReportBuilderPayload,
   type TestSquare,
+  type PersonalPropertyRoom,
+  type PersonalPropertyRoomKey,
+  type ExteriorCollateralItem,
+  type ExteriorCollateralType,
 } from "@/types/inspection";
 import HouseHub, { type HotspotState } from "@/components/inspection/HouseHub";
 import SectionDrawer from "@/components/inspection/SectionDrawer";
 import RoofSubHub from "@/components/inspection/RoofSubHub";
+import PersonalPropertyDrawer from "@/components/inspection/PersonalPropertyDrawer";
+import ExteriorCollateralDrawer from "@/components/inspection/ExteriorCollateralDrawer";
+import DetachedFullScreen from "@/components/inspection/DetachedFullScreen";
 import ReportBuilder from "@/components/inspection/ReportBuilder";
 import type { RepSignatureRow as RBRepSignatureRow } from "@/components/inspection/ReportBuilder";
 import { useInspectionAutosave } from "@/hooks/useInspectionAutosave";
@@ -551,6 +559,10 @@ export default function KnockingPage() {
   const [layerCount, setLayerCount] = useState<"1" | "2" | "3+" | null>(null);
   const [layerPhotoId, setLayerPhotoId] = useState<string | null>(null);
   const [detachedBuildings, setDetachedBuildings] = useState<DetachedBuilding[]>([]);
+  const [activeDetachedId, setActiveDetachedId] = useState<string | null>(null);
+  const [personalPropertyRooms, setPersonalPropertyRooms] = useState<PersonalPropertyRoom[]>([]);
+  const [exteriorCollateralItems, setExteriorCollateralItems] = useState<ExteriorCollateralItem[]>([]);
+  const [showGeneralNotes, setShowGeneralNotes] = useState(false);
   const [showReportBuilder, setShowReportBuilder] = useState(false);
   const [reportBuilderPayload, setReportBuilderPayload] = useState<ReportBuilderPayload>({
     cover: { intro: "", coverPhotoId: null },
@@ -600,6 +612,12 @@ export default function KnockingPage() {
   const knockStageIdsRef = useRef<Partial<Record<KnockStageTarget, number>> | null>(null);
 
   const { scheduleSave, saveLabel } = useInspectionAutosave({ inspectionId: activeInspectionId });
+
+  // Autosave new hub state slices (PP, EC, detached) — debounced inside the hook.
+  useEffect(() => {
+    if (!activeInspectionId) return;
+    scheduleSave({ metadata: { personalProperty: personalPropertyRooms, exteriorCollateral: exteriorCollateralItems, detachedBuildings } });
+  }, [activeInspectionId, personalPropertyRooms, exteriorCollateralItems, detachedBuildings, scheduleSave]);
 
   const geocodeApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
@@ -747,32 +765,17 @@ export default function KnockingPage() {
     console.warn("Knocking: could not run session inactivity timeout sweep.", timeoutError);
   }
 
-  function updateInspectionComponent(componentKey: string, isPresent: boolean) {
-    setInspectionChecklist((previous) => ({
-      ...previous,
-      componentPresence: {
-        ...previous.componentPresence,
-        [componentKey]: {
-          present: isPresent,
-          quantity: isPresent ? previous.componentPresence[componentKey]?.quantity ?? 1 : null,
+  function updateInspectionComponentItem(componentKey: string, patch: Partial<ComponentPresenceItem>) {
+    setInspectionChecklist((previous) => {
+      const existing = previous.componentPresence[componentKey] ?? { status: "unknown", quantity: null, condition: null, note: "" };
+      return {
+        ...previous,
+        componentPresence: {
+          ...previous.componentPresence,
+          [componentKey]: { ...existing, ...patch } as ComponentPresenceItem,
         },
-      },
-    }));
-  }
-
-  function updateInspectionComponentQuantity(componentKey: string, quantityText: string) {
-    const parsed = Number(quantityText);
-    setInspectionChecklist((previous) => ({
-      ...previous,
-      componentPresence: {
-        ...previous.componentPresence,
-        [componentKey]: {
-          ...previous.componentPresence[componentKey],
-          present: true,
-          quantity: Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0,
-        },
-      },
-    }));
+      };
+    });
   }
 
   // ── Hub v3 helpers ────────────────────────────────────────────────────────
@@ -789,6 +792,15 @@ export default function KnockingPage() {
   function computeHotspotState(key: HubSectionKey): HotspotState {
     const state = hubSectionStates[key];
     if (state?.manualComplete) return "override_complete";
+    if (key === "personal_property") {
+      const documentedCount = personalPropertyRooms.filter((r) => r.photoIds.length > 0 || r.note.trim()).length;
+      if (documentedCount === 0) return "untouched";
+      return "in_progress";
+    }
+    if (key === "exterior_collateral") {
+      if (exteriorCollateralItems.length === 0) return "untouched";
+      return "in_progress";
+    }
     const photoCount = photoCountsBySection[key as CaptureSection] ?? 0;
     const condition = state?.condition;
     if (key === "perimeter" && photoCount >= 8) return "complete";
@@ -2361,6 +2373,8 @@ export default function KnockingPage() {
                 roofDamage: roofDamageHub,
                 sectionStates: hubSectionStates,
                 detachedBuildings,
+                personalProperty: personalPropertyRooms,
+                exteriorCollateral: exteriorCollateralItems,
                 testSquares: roofDamageHub.testSquares,
                 reportBuilder: reportBuilderPayload.sections.length > 0 ? reportBuilderPayload : null,
               },
@@ -2538,6 +2552,10 @@ export default function KnockingPage() {
                 .filter(([, v]) => v?.condition)
                 .map(([k, v]) => [k, v!.condition!]),
             ),
+            // v3 coverage extensions
+            personalProperty: personalPropertyRooms,
+            exteriorCollateral: exteriorCollateralItems,
+            detachedBuildings,
           } as Record<string, unknown>;
 
           let reportBytes: ArrayBuffer | null = null;
@@ -2660,6 +2678,51 @@ export default function KnockingPage() {
             `Notes: ${inspectionSnapshot?.notes || "-"}`;
 
           await crmApi.createJobNote(linkedJobId, accessToken, summary);
+
+          // Push structured per-section notes as a rolled-up upsert note
+          if (inspectionRecordId) {
+            try {
+              const rollupLines: string[] = ["# Inspection Notes\n"];
+              const sectionLabelsMap: Record<string, string> = {
+                roof: "Roof", siding: "Siding", gutters: "Gutters",
+                windows: "Windows", interior: "Interior", attic: "Attic", perimeter: "Perimeter",
+              };
+              const condLabels: Record<string, string> = { good: "Good", damaged: "Damaged", missing: "Missing", not_visible: "Not Visible" };
+              for (const [sKey, sLabel] of Object.entries(sectionLabelsMap)) {
+                const st = hubSectionStates[sKey as HubSectionKey];
+                if (!st?.note?.trim() && !st?.condition) continue;
+                rollupLines.push(`## ${sLabel}`);
+                if (st.condition) rollupLines.push(`**Condition:** ${condLabels[st.condition] ?? st.condition}`);
+                if (st.note?.trim()) rollupLines.push(st.note.trim());
+                rollupLines.push("");
+              }
+              const noted = Object.entries(inspectionChecklist.componentPresence)
+                .filter(([, raw]) => ("status" in (raw ?? {}) ? (raw as Record<string, unknown>).status === "present" : (raw as Record<string, unknown>).present === true));
+              if (noted.length > 0) {
+                rollupLines.push("## Roof Components");
+                for (const [cKey, raw] of noted) {
+                  const item = raw as Record<string, unknown>;
+                  const name = cKey.replace(/_/g, " ");
+                  const parts = [name];
+                  if (item.quantity != null) parts.push(String(item.quantity));
+                  if (item.condition) parts.push(String(item.condition));
+                  if (typeof item.note === "string" && item.note.trim()) parts.push(`"${item.note.trim()}"`);
+                  rollupLines.push(`- ${parts.join(" — ")}`);
+                }
+              }
+              const rollupBody = rollupLines.join("\n").trim();
+              if (rollupBody) {
+                await fetch(`/api/crm/api/jobs/${linkedJobId}/notes`, {
+                  method: "POST",
+                  credentials: "include",
+                  headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+                  body: JSON.stringify({ body: rollupBody, source: "inspection", inspection_id: inspectionRecordId }),
+                });
+              }
+            } catch {
+              // Non-fatal — notes rollup failed
+            }
+          }
         } catch (inspectionError) {
           postSaveWarnings.push(
             `Inspection workflow assets warning: ${parseError(
@@ -3264,6 +3327,8 @@ export default function KnockingPage() {
                 { key: "windows", label: "Windows" },
                 { key: "interior", label: "Interior" },
                 { key: "attic", label: "Attic" },
+                { key: "personal_property", label: "Property" },
+                { key: "exterior_collateral", label: "Collateral" },
               ] as { key: HubSectionKey; label: string }[]).map((h) => ({
                 key: h.key,
                 label: h.label,
@@ -3277,14 +3342,185 @@ export default function KnockingPage() {
                 const building: DetachedBuilding = {
                   id: crypto.randomUUID(),
                   label: "shed",
+                  submitted: false,
+                  sections: {},
+                  photoIds: [],
                   completedAt: null,
                 };
                 setDetachedBuildings((prev) => [...prev, building]);
               }}
             />
 
+            {/* ── Detached buildings list ──────────────────── */}
+            {detachedBuildings.length > 0 && (
+              <div className="detached-list">
+                {detachedBuildings.map((b) => {
+                  const isSubmitted = !!b.submitted;
+                  const submitDisabled = b.label === "other" && !b.customLabel?.trim();
+                  const sectionsCount = b.sections ? Object.values(b.sections).filter((s) => s?.condition || s?.note?.trim() || s?.manualComplete).length : 0;
+                  if (isSubmitted) {
+                    return (
+                      <div key={b.id} className={`detached-card detached-card--collapsed${b.completedAt ? " detached-card--done" : ""}`}>
+                        <div className="detached-card-header">
+                          <span className="detached-card-title">
+                            {b.completedAt ? "✓ " : "🏚 "}
+                            {b.label === "other" && b.customLabel ? b.customLabel : b.label.charAt(0).toUpperCase() + b.label.slice(1)}
+                            <span className="detached-card-summary">
+                              {sectionsCount > 0 ? ` · ${sectionsCount} section${sectionsCount === 1 ? "" : "s"}` : " · Documenting…"}
+                            </span>
+                          </span>
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <button
+                              type="button"
+                              className="chip chip--xs active"
+                              onClick={() => setActiveDetachedId(b.id)}
+                            >
+                              Continue
+                            </button>
+                            <button
+                              type="button"
+                              className="detached-remove-btn"
+                              onClick={() => setDetachedBuildings((prev) => prev.filter((x) => x.id !== b.id))}
+                              aria-label="Remove"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div key={b.id} className={`detached-card${b.completedAt ? " detached-card--done" : ""}`}>
+                      <div className="detached-card-header">
+                        <span className="detached-card-title">
+                          {b.label === "other" && b.customLabel ? b.customLabel : b.label.charAt(0).toUpperCase() + b.label.slice(1)}
+                        </span>
+                        <button
+                          type="button"
+                          className="detached-remove-btn"
+                          onClick={() => setDetachedBuildings((prev) => prev.filter((x) => x.id !== b.id))}
+                          aria-label="Remove"
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <div className="detached-card-chips">
+                        {(["shed", "garage", "barn", "other"] as DetachedBuildingLabel[]).map((lbl) => (
+                          <button
+                            key={lbl}
+                            type="button"
+                            className={`chip chip--xs${b.label === lbl ? " active" : ""}`}
+                            onClick={() => setDetachedBuildings((prev) => prev.map((x) => x.id === b.id ? { ...x, label: lbl } : x))}
+                          >
+                            {lbl.charAt(0).toUpperCase() + lbl.slice(1)}
+                          </button>
+                        ))}
+                      </div>
+                      {b.label === "other" && (
+                        <input
+                          className="detached-custom-input"
+                          type="text"
+                          placeholder="Describe building…"
+                          value={b.customLabel ?? ""}
+                          onChange={(e) => setDetachedBuildings((prev) => prev.map((x) => x.id === b.id ? { ...x, customLabel: e.target.value } : x))}
+                        />
+                      )}
+                      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap" }}>
+                        <button
+                          type="button"
+                          className="chip chip--xs active"
+                          disabled={submitDisabled}
+                          style={{ opacity: submitDisabled ? 0.5 : 1, cursor: submitDisabled ? "not-allowed" : "pointer" }}
+                          onClick={() => {
+                            setDetachedBuildings((prev) => prev.map((x) => x.id === b.id ? { ...x, submitted: true, sections: x.sections ?? {}, photoIds: x.photoIds ?? [] } : x));
+                            setActiveDetachedId(b.id);
+                          }}
+                        >
+                          Submit & Document
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
             {/* ── Section drawers ──────────────────────────── */}
-            {activeHubSection && activeHubSection !== "roof" ? (
+            {activeHubSection === "personal_property" ? (
+              <div className="hub-drawer-overlay">
+                <PersonalPropertyDrawer
+                  rooms={personalPropertyRooms}
+                  photos={inspectionPhotos}
+                  manualComplete={hubSectionStates.personal_property?.manualComplete ?? false}
+                  onClose={() => setActiveHubSection(null)}
+                  onAddRoom={(key, customLabel) => {
+                    const id = crypto.randomUUID();
+                    const room: PersonalPropertyRoom = {
+                      id,
+                      key,
+                      customLabel,
+                      damageCause: "none",
+                      note: "",
+                      photoIds: [],
+                    };
+                    setPersonalPropertyRooms((prev) => [...prev, room]);
+                    return id;
+                  }}
+                  onRemoveRoom={(roomId) => {
+                    setPersonalPropertyRooms((prev) => prev.filter((r) => r.id !== roomId));
+                  }}
+                  onUpdateRoom={(roomId, patch) => {
+                    setPersonalPropertyRooms((prev) => prev.map((r) => r.id === roomId ? { ...r, ...patch } : r));
+                  }}
+                  onAddPhotos={async (_roomId, files, cause, note) => {
+                    return await addPhotosFromHub(files, { cause, slope: "", note }, "interior" as CaptureSection);
+                  }}
+                  onRemovePhoto={(photoId) => setInspectionPhotos((prev) => prev.filter((p) => p.id !== photoId))}
+                  onToggleManualComplete={() =>
+                    updateHubSection("personal_property", {
+                      manualComplete: !(hubSectionStates.personal_property?.manualComplete ?? false),
+                    })
+                  }
+                />
+              </div>
+            ) : activeHubSection === "exterior_collateral" ? (
+              <div className="hub-drawer-overlay">
+                <ExteriorCollateralDrawer
+                  items={exteriorCollateralItems}
+                  photos={inspectionPhotos}
+                  manualComplete={hubSectionStates.exterior_collateral?.manualComplete ?? false}
+                  onClose={() => setActiveHubSection(null)}
+                  onAddItem={(type, customLabel) => {
+                    const id = crypto.randomUUID();
+                    const item: ExteriorCollateralItem = {
+                      id,
+                      type,
+                      customTypeLabel: customLabel,
+                      condition: null,
+                      damageCause: "none",
+                      note: "",
+                      photoIds: [],
+                    };
+                    setExteriorCollateralItems((prev) => [...prev, item]);
+                    return id;
+                  }}
+                  onRemoveItem={(itemId) => setExteriorCollateralItems((prev) => prev.filter((i) => i.id !== itemId))}
+                  onUpdateItem={(itemId, patch) => {
+                    setExteriorCollateralItems((prev) => prev.map((i) => i.id === itemId ? { ...i, ...patch } : i));
+                  }}
+                  onAddPhotos={async (_itemId, files, cause, note) => {
+                    return await addPhotosFromHub(files, { cause, slope: "", note }, "collateral_damage" as CaptureSection);
+                  }}
+                  onRemovePhoto={(photoId) => setInspectionPhotos((prev) => prev.filter((p) => p.id !== photoId))}
+                  onToggleManualComplete={() =>
+                    updateHubSection("exterior_collateral", {
+                      manualComplete: !(hubSectionStates.exterior_collateral?.manualComplete ?? false),
+                    })
+                  }
+                />
+              </div>
+            ) : activeHubSection && activeHubSection !== "roof" ? (
               <div className="hub-drawer-overlay">
                 <SectionDrawer
                   config={{
@@ -3311,6 +3547,24 @@ export default function KnockingPage() {
                 />
               </div>
             ) : null}
+
+            {/* ── Detached structure full-screen takeover ── */}
+            {activeDetachedId ? (() => {
+              const building = detachedBuildings.find((b) => b.id === activeDetachedId);
+              if (!building) return null;
+              return (
+                <DetachedFullScreen
+                  building={building}
+                  photos={inspectionPhotos}
+                  onClose={() => setActiveDetachedId(null)}
+                  onUpdate={(patch) => {
+                    setDetachedBuildings((prev) => prev.map((b) => (b.id === activeDetachedId ? { ...b, ...patch } : b)));
+                  }}
+                  onAddPhotos={(files, tags, section) => addPhotosFromHub(files, tags, section)}
+                  onRemovePhoto={(photoId) => setInspectionPhotos((prev) => prev.filter((p) => p.id !== photoId))}
+                />
+              );
+            })() : null}
 
             {/* ── Roof sub-hub ─────────────────────────────── */}
             {showRoofHub ? (
@@ -3355,8 +3609,7 @@ export default function KnockingPage() {
                   onRoofAge={setEstimatedRoofAgeYears}
                   onLayerCount={setLayerCount}
                   onLayerPhoto={setLayerPhotoId}
-                  onComponentToggle={updateInspectionComponent}
-                  onComponentQty={updateInspectionComponentQuantity}
+                  onComponentChange={updateInspectionComponentItem}
                   onRoofDamage={(patch) => setRoofDamageHub((prev) => ({ ...prev, ...patch }))}
                 />
               </div>
@@ -3398,7 +3651,7 @@ export default function KnockingPage() {
               <button
                 type="button"
                 className="hub-footer-btn"
-                onClick={() => updateHubSection("perimeter", { note: (hubSectionStates.perimeter?.note ?? "") + " " })}
+                onClick={() => setShowGeneralNotes(true)}
               >
                 📝 Notes
               </button>
@@ -3411,6 +3664,31 @@ export default function KnockingPage() {
                 {saving ? "Saving…" : "Generate Report →"}
               </button>
             </div>
+
+            {/* ── General inspection notes overlay ─────────── */}
+            {showGeneralNotes && (
+              <div className="done-confirm-overlay" onClick={() => setShowGeneralNotes(false)}>
+                <div className="done-confirm-dialog" style={{ maxWidth: 480 }} onClick={(e) => e.stopPropagation()}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+                    <h3 style={{ margin: 0, fontSize: 15 }}>📝 Inspection Notes</h3>
+                    <button type="button" className="hub-footer-btn" style={{ padding: "4px 10px" }} onClick={() => setShowGeneralNotes(false)}>
+                      Close
+                    </button>
+                  </div>
+                  <p style={{ margin: "0 0 8px", fontSize: 12, color: "var(--muted)" }}>
+                    General notes for this inspection — included in the PDF report.
+                  </p>
+                  <textarea
+                    className="comp-search-input"
+                    style={{ width: "100%", minHeight: 140, resize: "vertical", boxSizing: "border-box" }}
+                    placeholder="Add general observations, access notes, homeowner concerns…"
+                    value={inspectionChecklist.notes ?? ""}
+                    onChange={(e) => setInspectionChecklist((prev) => ({ ...prev, notes: e.target.value }))}
+                    autoFocus
+                  />
+                </div>
+              </div>
+            )}
           </div>
         ) : null}
       </section>

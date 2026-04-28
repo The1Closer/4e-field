@@ -139,7 +139,7 @@ export function useInspectionAutosave({ inspectionId, debounceMs = 750 }: Autosa
 
   const saveLabel = (() => {
     if (saveStatus === "saving") return "Saving…";
-    if (saveStatus === "error") return "Save failed — will retry";
+    if (saveStatus === "error") return "Saved offline — will sync";
     if (saveStatus === "offline") return "Will sync when online";
     if (saveStatus === "saved" && lastSavedAt) {
       const diffSec = Math.round((Date.now() - lastSavedAt.getTime()) / 1000);
