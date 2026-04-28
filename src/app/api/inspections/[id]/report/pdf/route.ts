@@ -21,12 +21,37 @@ type InspectionPhotoRow = {
 };
 
 type ReportPayload = {
+  // v2 legacy fields
   sections?: Record<string, unknown>;
   homeowner?: Record<string, unknown>;
   roofOverview?: Record<string, unknown>;
   interiorAttic?: Record<string, unknown>;
   signature?: Record<string, unknown>;
   notes?: unknown;
+  // v3 builder fields
+  builderSections?: Array<{
+    key: string;
+    title: string;
+    visible: boolean;
+    includePhotos: boolean;
+    photoIds: string[];
+  }>;
+  builderCover?: {
+    intro: string;
+    coverPhotoId: string | null;
+  };
+  builderClosing?: {
+    notes: string;
+  };
+  // v3 metadata
+  testSquares?: Array<{
+    id: string;
+    slope: string;
+    photoId: string | null;
+    hitCount: number | null;
+    note: string;
+  }>;
+  sectionConditions?: Record<string, string>;
 };
 
 const PAGE_WIDTH = 612;
@@ -299,15 +324,26 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const interiorAttic = (payload.interiorAttic ?? {}) as Record<string, unknown>;
     const signature = (payload.signature ?? {}) as Record<string, unknown>;
 
+    // v3 builder fields
+    const builderSections = Array.isArray(payload.builderSections) ? payload.builderSections : null;
+    const builderCover = payload.builderCover ?? null;
+    const builderClosing = payload.builderClosing ?? null;
+    const testSquares = Array.isArray(payload.testSquares) ? payload.testSquares : [];
+
     const supabase = getRouteSupabaseClient(request);
 
-    const { data: photoRows, error: photoError } = selectedPhotoIds.length
+    // Collect all photo IDs we need — from selectedPhotoIds (v2) or all builder section photoIds (v3)
+    const allNeededPhotoIds = builderSections
+      ? [...new Set(builderSections.flatMap((s) => s.photoIds))]
+      : selectedPhotoIds;
+
+    const { data: photoRows, error: photoError } = allNeededPhotoIds.length
       ? await supabase
           .from("inspection_photos")
           .select("id,file_name,file_path,content_type,capture_section,damage_cause,notes")
           .eq("inspection_id", inspectionId)
           .eq("rep_id", userId)
-          .in("id", selectedPhotoIds)
+          .in("id", allNeededPhotoIds)
       : { data: [], error: null };
 
     if (photoError) throw new Error(photoError.message);
@@ -317,11 +353,20 @@ export async function POST(request: NextRequest, context: RouteContext) {
       rowMap.set(row.id, row);
     }
 
-    const orderedRows = selectedPhotoIds
-      .map((id) => rowMap.get(id))
-      .filter((row): row is InspectionPhotoRow => Boolean(row))
-      .filter((row) => isPhotoEnabledBySections(row, sections))
-      .sort((a, b) => sectionSortKey(a.capture_section) - sectionSortKey(b.capture_section));
+    // Build ordered rows for the gallery
+    let orderedRows: InspectionPhotoRow[];
+    if (builderSections) {
+      // v3: respect the builder section order and per-section photo lists
+      orderedRows = builderSections
+        .filter((s) => s.visible && s.includePhotos)
+        .flatMap((s) => s.photoIds.map((id) => rowMap.get(id)).filter((r): r is InspectionPhotoRow => Boolean(r)));
+    } else {
+      orderedRows = selectedPhotoIds
+        .map((id) => rowMap.get(id))
+        .filter((row): row is InspectionPhotoRow => Boolean(row))
+        .filter((row) => isPhotoEnabledBySections(row, sections))
+        .sort((a, b) => sectionSortKey(a.capture_section) - sectionSortKey(b.capture_section));
+    }
     const limitedRows = orderedRows.slice(0, MAX_REPORT_PHOTOS);
     const omittedPhotoCount = Math.max(0, orderedRows.length - limitedRows.length);
 
@@ -329,6 +374,49 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const font = await doc.embedFont(StandardFonts.Helvetica);
     const bold = await doc.embedFont(StandardFonts.HelveticaBold);
     const title = (body.title || "Inspection Report").trim() || "Inspection Report";
+
+    // ── v3 Cover page (only when builder intro is provided) ────────────────
+    if (builderCover?.intro?.trim()) {
+      const coverPage = doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
+
+      // Brand blue header bar
+      coverPage.drawRectangle({ x: 0, y: PAGE_HEIGHT - 120, width: PAGE_WIDTH, height: 120, color: rgb(0.12, 0.31, 0.55) });
+
+      const logoBytes = await loadLocalLogoBytes();
+      if (logoBytes) {
+        const logoImage = await embedImage(doc, logoBytes, "image/png", "4ELogo.png");
+        if (logoImage) {
+          drawImageFit(coverPage, logoImage, { x: PAGE_WIDTH - MARGIN - 120, y: PAGE_HEIGHT - 108, width: 100, height: 88 });
+        }
+      }
+
+      coverPage.drawText(title, { x: MARGIN, y: PAGE_HEIGHT - 52, size: 22, font: bold, color: rgb(1, 1, 1) });
+      coverPage.drawText(`Generated: ${formatDateTime(new Date())}`, {
+        x: MARGIN, y: PAGE_HEIGHT - 72, size: 9, font, color: rgb(0.82, 0.88, 0.97),
+      });
+
+      // Cover photo (if selected)
+      if (builderCover.coverPhotoId) {
+        const coverPhotoRow = rowMap.get(builderCover.coverPhotoId);
+        if (coverPhotoRow) {
+          const dl = await supabase.storage.from("inspection-media").download(coverPhotoRow.file_path);
+          if (!dl.error && dl.data) {
+            const bytes = new Uint8Array(await dl.data.arrayBuffer());
+            const img = await embedImage(doc, bytes, coverPhotoRow.content_type, coverPhotoRow.file_name);
+            if (img) {
+              drawImageFit(coverPage, img, { x: MARGIN, y: PAGE_HEIGHT - 380, width: PAGE_WIDTH - MARGIN * 2, height: 240 });
+            }
+          }
+        }
+      }
+
+      // Intro paragraph
+      let introCursor = builderCover.coverPhotoId ? PAGE_HEIGHT - 400 : PAGE_HEIGHT - 160;
+      introCursor = drawWrappedText(coverPage, builderCover.intro, {
+        x: MARGIN, y: introCursor, maxWidth: PAGE_WIDTH - MARGIN * 2,
+        font, size: 11, lineHeight: 16, color: rgb(0.12, 0.12, 0.14),
+      });
+    }
 
     const summaryPage = doc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
 
@@ -406,42 +494,117 @@ export async function POST(request: NextRequest, context: RouteContext) {
       cursorY -= 2;
     };
 
-    if (sections.homeowner !== false) {
-      drawHeader("Homeowner");
-      drawLine("Name", homeowner.homeownerName);
-      drawLine("Phone", homeowner.phone);
-      drawLine("Email", homeowner.email);
-      cursorY -= 4;
-    }
-
-    if (sections.roofOverview !== false) {
-      drawHeader("Roof Overview");
-      drawLine("Shingle Length (in)", roofOverview.shingleLengthInches);
-      drawLine("Shingle Width (in)", roofOverview.shingleWidthInches);
-      drawLine("Drip Edge Present", roofOverview.dripEdgePresent);
-      cursorY -= 4;
-    }
-
-    if (sections.interiorAttic === true) {
-      drawHeader("Interior + Attic");
-      drawLine("Interior Status", interiorAttic.interiorStatus);
-      drawLine("Interior Skip Reason", interiorAttic.interiorSkipReason);
-      drawLine("Attic Status", interiorAttic.atticStatus);
-      drawLine("Attic Skip Reason", interiorAttic.atticSkipReason);
-      cursorY -= 4;
-    }
-
-    const notes = typeof payload.notes === "string" ? payload.notes.trim() : "";
-    if (notes.length > 0) {
-      drawHeader("Summary Notes");
-      cursorY = drawWrappedText(summaryPage, notes, {
-        x: MARGIN,
-        y: cursorY,
-        maxWidth: contentWidth - 220,
-        font,
-        size: 10,
-        lineHeight: 13,
+    // ── Section conditions helper ────────────────────────────────────────────
+    function drawConditionBadge(page: PDFPage, condition: string, x: number, y: number) {
+      const conditionColors: Record<string, [number, number, number]> = {
+        good:        [0.18, 0.54, 0.28],
+        damaged:     [0.75, 0.19, 0.18],
+        missing:     [0.84, 0.70, 0.47],
+        not_visible: [0.42, 0.44, 0.46],
+      };
+      const c = conditionColors[condition] ?? [0.42, 0.44, 0.46];
+      page.drawRectangle({ x, y: y - 3, width: 64, height: 13, color: rgb(c[0], c[1], c[2]) });
+      page.drawText(condition.replace(/_/g, " ").toUpperCase(), {
+        x: x + 4, y: y - 1, size: 7, font: bold, color: rgb(1, 1, 1),
       });
+    }
+
+    if (builderSections) {
+      // ── v3: render visible sections from builder ─────────────────────────
+      for (const bs of builderSections.filter((s) => s.visible)) {
+        if (cursorY < 80) break;
+        drawHeader(bs.title || bs.key);
+
+        // Condition badge if section has a condition stored in sectionConditions
+        const cond = (payload.sectionConditions ?? {})[bs.key];
+        if (cond) {
+          drawConditionBadge(summaryPage, cond, MARGIN + contentWidth - 80, cursorY + 14);
+        }
+
+        // Special content for known sections
+        if (bs.key === "roof_overview" || bs.key === "roof") {
+          drawLine("Shingle Length (in)", roofOverview.shingleLengthInches);
+          drawLine("Shingle Width (in)", roofOverview.shingleWidthInches);
+          drawLine("Drip Edge Present", roofOverview.dripEdgePresent);
+        } else if (bs.key === "roof_damage" || bs.key === "damage") {
+          // Test square table
+          if (testSquares.length > 0) {
+            cursorY -= 4;
+            summaryPage.drawText("Test Squares:", { x: MARGIN, y: cursorY, size: 9, font: bold, color: rgb(0.18, 0.18, 0.22) });
+            cursorY -= 13;
+            for (const ts of testSquares) {
+              if (cursorY < 80) break;
+              const line = `  ${ts.slope ? ts.slope.toUpperCase() : "ANY"} slope — ${ts.hitCount ?? "?"} hits${ts.note ? ` (${ts.note})` : ""}`;
+              cursorY = drawWrappedText(summaryPage, line, { x: MARGIN + 8, y: cursorY, maxWidth: contentWidth - 230, font, size: 9, lineHeight: 12, color: rgb(0.2, 0.2, 0.24) });
+              cursorY -= 2;
+            }
+          }
+        } else if ((bs.key === "interior" || bs.key === "interior_attic") && Object.keys(interiorAttic).length > 0) {
+          drawLine("Interior Status", interiorAttic.interiorStatus);
+          drawLine("Attic Status", interiorAttic.atticStatus);
+        }
+        cursorY -= 4;
+      }
+
+      // Closing notes
+      const closingNotes = builderClosing?.notes?.trim() ?? "";
+      if (closingNotes.length > 0) {
+        if (cursorY >= 80) {
+          drawHeader("Closing Notes");
+          cursorY = drawWrappedText(summaryPage, closingNotes, { x: MARGIN, y: cursorY, maxWidth: contentWidth - 220, font, size: 10, lineHeight: 13 });
+        }
+      }
+    } else {
+      // ── v2 legacy section rendering ──────────────────────────────────────
+      if (sections.homeowner !== false) {
+        drawHeader("Homeowner");
+        drawLine("Name", homeowner.homeownerName);
+        drawLine("Phone", homeowner.phone);
+        drawLine("Email", homeowner.email);
+        cursorY -= 4;
+      }
+
+      if (sections.roofOverview !== false) {
+        drawHeader("Roof Overview");
+        drawLine("Shingle Length (in)", roofOverview.shingleLengthInches);
+        drawLine("Shingle Width (in)", roofOverview.shingleWidthInches);
+        drawLine("Drip Edge Present", roofOverview.dripEdgePresent);
+        cursorY -= 4;
+      }
+
+      if (sections.interiorAttic === true) {
+        drawHeader("Interior + Attic");
+        drawLine("Interior Status", interiorAttic.interiorStatus);
+        drawLine("Interior Skip Reason", interiorAttic.interiorSkipReason);
+        drawLine("Attic Status", interiorAttic.atticStatus);
+        drawLine("Attic Skip Reason", interiorAttic.atticSkipReason);
+        cursorY -= 4;
+      }
+
+      // Test squares (v3 data embedded in v2 call)
+      if (testSquares.length > 0) {
+        drawHeader("Hail Test Squares");
+        for (const ts of testSquares) {
+          if (cursorY < 80) break;
+          const line = `${ts.slope ? ts.slope.toUpperCase() : "ANY"} slope — ${ts.hitCount ?? "?"} strikes${ts.note ? ` · ${ts.note}` : ""}`;
+          cursorY = drawWrappedText(summaryPage, line, { x: MARGIN, y: cursorY, maxWidth: contentWidth - 220, font, size: 10, lineHeight: 13, color: rgb(0.12, 0.12, 0.12) });
+          cursorY -= 2;
+        }
+        cursorY -= 4;
+      }
+
+      const notes = typeof payload.notes === "string" ? payload.notes.trim() : "";
+      if (notes.length > 0) {
+        drawHeader("Summary Notes");
+        cursorY = drawWrappedText(summaryPage, notes, {
+          x: MARGIN,
+          y: cursorY,
+          maxWidth: contentWidth - 220,
+          font,
+          size: 10,
+          lineHeight: 13,
+        });
+      }
     }
 
     if (sections.signature !== false) {

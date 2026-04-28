@@ -33,7 +33,20 @@ import {
   type DamageCause,
   type InspectionPhotoDraft,
   type InspectionStepKey,
+  type HubSectionKey,
+  type SectionCondition,
+  type HubSectionStates,
+  type RoofDamageMetrics,
+  type DetachedBuilding,
+  type ReportBuilderPayload,
+  type TestSquare,
 } from "@/types/inspection";
+import HouseHub, { type HotspotState } from "@/components/inspection/HouseHub";
+import SectionDrawer from "@/components/inspection/SectionDrawer";
+import RoofSubHub from "@/components/inspection/RoofSubHub";
+import ReportBuilder from "@/components/inspection/ReportBuilder";
+import type { RepSignatureRow as RBRepSignatureRow } from "@/components/inspection/ReportBuilder";
+import { useInspectionAutosave } from "@/hooks/useInspectionAutosave";
 import type { JsonRecord } from "@/types/models";
 
 type KnockSessionRow = JsonRecord & {
@@ -524,6 +537,32 @@ export default function KnockingPage() {
   const [savingSignature, setSavingSignature] = useState(false);
   const [signatureDrawn, setSignatureDrawn] = useState(false);
 
+  // ── Hub v3 state ─────────────────────────────────────────────────────────
+  const [activeHubSection, setActiveHubSection] = useState<HubSectionKey | null>(null);
+  const [showRoofHub, setShowRoofHub] = useState(false);
+  const [hubSectionStates, setHubSectionStates] = useState<HubSectionStates>({});
+  const [roofDamageHub, setRoofDamageHub] = useState<RoofDamageMetrics>({
+    windShingleCount: null,
+    hailCount: null,
+    slopesAffected: [],
+    testSquares: [],
+  });
+  const [estimatedRoofAgeYears, setEstimatedRoofAgeYears] = useState<number | null>(null);
+  const [layerCount, setLayerCount] = useState<"1" | "2" | "3+" | null>(null);
+  const [layerPhotoId, setLayerPhotoId] = useState<string | null>(null);
+  const [detachedBuildings, setDetachedBuildings] = useState<DetachedBuilding[]>([]);
+  const [showReportBuilder, setShowReportBuilder] = useState(false);
+  const [reportBuilderPayload, setReportBuilderPayload] = useState<ReportBuilderPayload>({
+    cover: { intro: "", coverPhotoId: null },
+    sections: [],
+    closing: { notes: "" },
+    contingent: false,
+    signatureId: null,
+    signaturePath: null,
+  });
+  const [activeInspectionId, setActiveInspectionId] = useState<string | null>(null);
+  // ── /Hub v3 state ─────────────────────────────────────────────────────────
+
   const [syncQueueCount, setSyncQueueCount] = useState(0);
   const [syncingNow, setSyncingNow] = useState(false);
   const [syncStatusMessage, setSyncStatusMessage] = useState<string | null>(null);
@@ -559,6 +598,8 @@ export default function KnockingPage() {
   const signatureDrawingRef = useRef(false);
   const timeoutSweepWarnedRef = useRef(false);
   const knockStageIdsRef = useRef<Partial<Record<KnockStageTarget, number>> | null>(null);
+
+  const { scheduleSave, saveLabel } = useInspectionAutosave({ inspectionId: activeInspectionId });
 
   const geocodeApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ?? "";
 
@@ -601,6 +642,10 @@ export default function KnockingPage() {
         damage: 0,
         interior: 0,
         attic: 0,
+        siding: 0,
+        gutters: 0,
+        windows: 0,
+        roof_damage_test_square: 0,
         other: 0,
       } as Record<CaptureSection, number>,
     );
@@ -729,6 +774,62 @@ export default function KnockingPage() {
       },
     }));
   }
+
+  // ── Hub v3 helpers ────────────────────────────────────────────────────────
+  function updateHubSection(key: HubSectionKey, patch: Partial<{ condition: SectionCondition | null; note: string; manualComplete: boolean; manualIncomplete: boolean }>) {
+    setHubSectionStates((prev) => ({
+      ...prev,
+      [key]: { condition: null, note: "", manualComplete: false, manualIncomplete: false, ...prev[key], ...patch },
+    }));
+    if (activeInspectionId) {
+      scheduleSave({ metadata: { hubSectionStates: { ...hubSectionStates, [key]: { condition: null, note: "", manualComplete: false, manualIncomplete: false, ...hubSectionStates[key], ...patch } } } });
+    }
+  }
+
+  function computeHotspotState(key: HubSectionKey): HotspotState {
+    const state = hubSectionStates[key];
+    if (state?.manualComplete) return "override_complete";
+    const photoCount = photoCountsBySection[key as CaptureSection] ?? 0;
+    const condition = state?.condition;
+    if (key === "perimeter" && photoCount >= 8) return "complete";
+    if (key === "roof") {
+      const overviewCount = photoCountsBySection["roof_overview"] ?? 0;
+      if (overviewCount >= 8 && inspectionChecklist.shingleLengthInches && inspectionChecklist.shingleWidthInches) return "complete";
+      if (overviewCount > 0) return "in_progress";
+      return "untouched";
+    }
+    if (condition) {
+      if (condition === "good" || photoCount >= 1) return "complete";
+      return "in_progress";
+    }
+    if (photoCount > 0) return "in_progress";
+    return "untouched";
+  }
+
+  async function addPhotosFromHub(
+    files: File[],
+    tags: { cause: DamageCause; slope: DamageSlope | ""; note: string },
+    captureSection: CaptureSection,
+  ): Promise<InspectionPhotoDraft[]> {
+    const newPhotos: InspectionPhotoDraft[] = files.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      captureSection,
+      damageCause: tags.cause,
+      slopeTag: tags.slope,
+      componentTag: "",
+      customTag: "",
+      note: tags.note,
+      autoTagged: false,
+    }));
+    setInspectionPhotos((prev) => [...prev, ...newPhotos]);
+    setReportPhotoSelection((prev) => ({
+      ...prev,
+      ...Object.fromEntries(newPhotos.map((p) => [p.id, true])),
+    }));
+    return newPhotos;
+  }
+  // ── /Hub v3 helpers ───────────────────────────────────────────────────────
 
   function pushInspectionPhotos(
     files: FileList | null,
@@ -2241,10 +2342,13 @@ export default function KnockingPage() {
                 collateralDamagePhotoCount: photoCountsBySection.collateral_damage,
               },
               metadata: {
-                guidedFlowVersion: "v2",
+                guidedFlowVersion: "v3",
                 shingleLengthInches: inspectionChecklist.shingleLengthInches || null,
                 shingleWidthInches: inspectionChecklist.shingleWidthInches || null,
                 dripEdgePresent: inspectionChecklist.dripEdgePresent,
+                estimatedRoofAgeYears,
+                layerCount,
+                layerPhotoId,
                 contingent: isContingent,
                 notes: inspectionChecklist.notes,
                 interiorStatus: inspectionChecklist.interiorStatus,
@@ -2254,6 +2358,11 @@ export default function KnockingPage() {
                 signatureId: signatureRecordId,
                 signaturePath: selectedSignature?.file_path ?? null,
                 requiredPhotoCounts: REQUIRED_PHOTO_COUNTS,
+                roofDamage: roofDamageHub,
+                sectionStates: hubSectionStates,
+                detachedBuildings,
+                testSquares: roofDamageHub.testSquares,
+                reportBuilder: reportBuilderPayload.sections.length > 0 ? reportBuilderPayload : null,
               },
             }),
           });
@@ -2364,6 +2473,10 @@ export default function KnockingPage() {
 
           const reportPayloadData = {
             logo: "/4ELogo.png",
+            // v3 ordered sections if builder was used; v2 toggles for backward compat
+            builderSections: reportBuilderPayload.sections.length > 0 ? reportBuilderPayload.sections : null,
+            builderCover: reportBuilderPayload.sections.length > 0 ? reportBuilderPayload.cover : null,
+            builderClosing: reportBuilderPayload.sections.length > 0 ? reportBuilderPayload.closing : null,
             sections: reportSectionSelection,
             homeowner: reportSectionSelection.homeowner ? homeownerIntake : null,
             perimeterPhotos: reportSectionSelection.perimeterPhotos
@@ -2418,6 +2531,13 @@ export default function KnockingPage() {
               : null,
             notes: reportSectionSelection.summaryNotes ? inspectionChecklist.notes : null,
             selectedDraftPhotoIds: Array.from(selectedDraftPhotoIds),
+            // v3 extras always included so the PDF route can use them regardless of v2/v3 mode
+            testSquares: roofDamageHub.testSquares,
+            sectionConditions: Object.fromEntries(
+              Object.entries(hubSectionStates)
+                .filter(([, v]) => v?.condition)
+                .map(([k, v]) => [k, v!.condition!]),
+            ),
           } as Record<string, unknown>;
 
           let reportBytes: ArrayBuffer | null = null;
@@ -3119,673 +3239,179 @@ export default function KnockingPage() {
         ) : null}
 
         {isActive && step === "inspection" ? (
-          <form
-            className="knock-step stack"
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (inspectionFlowStep.key !== "report_signature") {
-                goToNextInspectionStep();
-                return;
-              }
-              if (!stepReady("report_signature")) {
-                setError("Rep signature name and a saved or drawn signature are required before submit.");
-                return;
-              }
-              if (photoRequirementWarnings.length > 0) {
-                setMessage(`Warning: ${photoRequirementWarnings.join(" | ")}. Submitting anyway.`);
-              }
-              void logEvent({
-                action: "knock",
-                outcome: "inspection",
-                homeownerRequired: true,
-                contingentOverride: inspectionChecklist.contingent,
-              });
-            }}
-          >
-            <h2>
-              Guided Inspection: {inspectionFlowStep.label} ({inspectionStepIndex + 1}/{INSPECTION_FLOW.length})
-            </h2>
-            <p className="hint">{inspectionFlowStep.description}</p>
-            <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
-              {INSPECTION_FLOW.map((flowStep, index) => (
-                <span
-                  key={flowStep.key}
-                  className="hint"
-                  style={{
-                    border: "1px solid var(--border)",
-                    borderRadius: 999,
-                    padding: "2px 10px",
-                    background:
-                      index === inspectionStepIndex ? "var(--panel-soft-hover)" : "transparent",
-                  }}
-                >
-                  {index + 1}. {flowStep.label}
-                </span>
-              ))}
+          <div className="knock-step hub-root">
+            {/* ── Hub header ──────────────────────────────────── */}
+            <div className="hub-header">
+              <div className="hub-header__left">
+                <h2 className="hub-header__title">Inspection</h2>
+                <span className="hub-address">{homeownerIntake.address || "Address not set"}</span>
+              </div>
+              <div className="hub-header__right">
+                {saveLabel ? <span className="hub-save-label">{saveLabel}</span> : null}
+                <button type="button" className="secondary hub-back-btn" onClick={() => setStep("homeowner")}>
+                  ← Back
+                </button>
+              </div>
             </div>
 
-            {inspectionFlowStep.key === "perimeter_photos" ? (
-              <div className="stack">
-                <label className="stack">
-                  Add perimeter photos
-                  <input
-                    type="file"
-                    multiple
-                    accept="image/jpeg,image/png"
-                    onChange={(event) => {
-                      pushInspectionPhotos(event.target.files, {
-                        captureSection: "perimeter_photos",
-                        damageCause: "none",
-                      });
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
-                <p className="hint">
-                  Perimeter photos: {photoCountsBySection.perimeter_photos}/{REQUIRED_PHOTO_COUNTS.perimeterPhotos}
-                </p>
-                {missingRequiredPhotos.perimeterPhotos > 0 ? (
-                  <p className="hint">
-                    Warning only: you are short {missingRequiredPhotos.perimeterPhotos} perimeter photo(s).
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
+            {/* ── House Hub ──────────────────────────────────── */}
+            <HouseHub
+              hotspots={([
+                { key: "roof", label: "Roof" },
+                { key: "perimeter", label: "Perimeter" },
+                { key: "siding", label: "Siding" },
+                { key: "gutters", label: "Gutters" },
+                { key: "windows", label: "Windows" },
+                { key: "interior", label: "Interior" },
+                { key: "attic", label: "Attic" },
+              ] as { key: HubSectionKey; label: string }[]).map((h) => ({
+                key: h.key,
+                label: h.label,
+                state: computeHotspotState(h.key),
+              }))}
+              onTap={(key) => {
+                if (key === "roof") { setShowRoofHub(true); }
+                else { setActiveHubSection(key); }
+              }}
+              onAddDetached={() => {
+                const building: DetachedBuilding = {
+                  id: crypto.randomUUID(),
+                  label: "shed",
+                  completedAt: null,
+                };
+                setDetachedBuildings((prev) => [...prev, building]);
+              }}
+            />
 
-            {inspectionFlowStep.key === "collateral_damage" ? (
-              <div className="stack">
-                <label className="stack">
-                  Collateral damage photo
-                  <input
-                    type="file"
-                    accept="image/jpeg,image/png"
-                    onChange={(event) => {
-                      setCollateralPhotoDraft((previous) => ({
-                        ...previous,
-                        file: event.target.files?.[0] ?? null,
-                      }));
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
-                {collateralPhotoDraft.file ? (
-                  <p className="hint">Selected: {collateralPhotoDraft.file.name}</p>
-                ) : (
-                  <p className="hint">Select or capture one photo, then save.</p>
-                )}
-                <label className="stack">
-                  Damage type (optional)
-                  <select
-                    value={collateralPhotoDraft.damageCause}
-                    onChange={(event) =>
-                      setCollateralPhotoDraft((previous) => ({
-                        ...previous,
-                        damageCause: event.target.value as DamageCause,
-                      }))
-                    }
-                  >
-                    <option value="none">None</option>
-                    <option value="hail">Hail</option>
-                    <option value="wind">Wind</option>
-                    <option value="other">Other</option>
-                  </select>
-                </label>
-                <label className="stack">
-                  Slope (optional)
-                  <select
-                    value={collateralPhotoDraft.slopeTag}
-                    onChange={(event) =>
-                      setCollateralPhotoDraft((previous) => ({
-                        ...previous,
-                        slopeTag: event.target.value as DamageSlope | "",
-                      }))
-                    }
-                  >
-                    <option value="">Not set</option>
-                    <option value="front">Front</option>
-                    <option value="rear">Rear</option>
-                    <option value="left">Left</option>
-                    <option value="right">Right</option>
-                    <option value="other">Other</option>
-                  </select>
-                </label>
-                <label className="stack">
-                  Component tag (optional)
-                  <input
-                    value={collateralPhotoDraft.componentTag}
-                    onChange={(event) =>
-                      setCollateralPhotoDraft((previous) => ({ ...previous, componentTag: event.target.value }))
-                    }
-                  />
-                </label>
-                <label className="stack">
-                  Free-text tag (optional)
-                  <input
-                    value={collateralPhotoDraft.customTag}
-                    onChange={(event) =>
-                      setCollateralPhotoDraft((previous) => ({ ...previous, customTag: event.target.value }))
-                    }
-                  />
-                </label>
-                <label className="stack">
-                  Note (optional)
-                  <input
-                    value={collateralPhotoDraft.note}
-                    onChange={(event) =>
-                      setCollateralPhotoDraft((previous) => ({ ...previous, note: event.target.value }))
-                    }
-                  />
-                </label>
-                <div className="row">
-                  <button
-                    type="button"
-                    disabled={!collateralPhotoDraft.file}
-                    onClick={() => {
-                      const saved = addQuickTaggedPhoto(collateralPhotoDraft, "collateral_damage");
-                      if (!saved) return;
-                      setCollateralPhotoDraft((previous) => ({
-                        ...previous,
-                        file: null,
-                        note: "",
-                        customTag: "",
-                        componentTag: "",
-                      }));
-                    }}
-                  >
-                    Save Collateral Photo
-                  </button>
-                </div>
-                <p className="hint">Collateral photos captured: {photoCountsBySection.collateral_damage}</p>
-              </div>
-            ) : null}
-
-            {inspectionFlowStep.key === "roof_overview" ? (
-              <div className="stack">
-                <label className="stack">
-                  Overview photos
-                  <input
-                    type="file"
-                    multiple
-                    accept="image/jpeg,image/png"
-                    onChange={(event) => {
-                      pushInspectionPhotos(event.target.files, {
-                        captureSection: "roof_overview",
-                        damageCause: "none",
-                      });
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
-                <label className="stack">
-                  Layer photo (auto-tagged)
-                  <input
-                    type="file"
-                    accept="image/jpeg,image/png"
-                    onChange={(event) => {
-                      pushInspectionPhotos(event.target.files, {
-                        captureSection: "roof_overview",
-                        damageCause: "none",
-                        componentTag: "layer_photo",
-                        customTag: "layer_photo",
-                        autoTagged: true,
-                      });
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
-                <div className="grid">
-                  <label className="stack">
-                    Shingle length (inches, optional)
-                    <input
-                      inputMode="decimal"
-                      value={inspectionChecklist.shingleLengthInches}
-                      onChange={(event) =>
-                        setInspectionChecklist((previous) => ({
-                          ...previous,
-                          shingleLengthInches: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                  <label className="stack">
-                    Shingle width (inches, optional)
-                    <input
-                      inputMode="decimal"
-                      value={inspectionChecklist.shingleWidthInches}
-                      onChange={(event) =>
-                        setInspectionChecklist((previous) => ({
-                          ...previous,
-                          shingleWidthInches: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                </div>
-                <label className="stack">
-                  Drip edge present?
-                  <select
-                    value={
-                      inspectionChecklist.dripEdgePresent === null
-                        ? ""
-                        : inspectionChecklist.dripEdgePresent
-                          ? "yes"
-                          : "no"
-                    }
-                    onChange={(event) =>
-                      setInspectionChecklist((previous) => ({
-                        ...previous,
-                        dripEdgePresent:
-                          event.target.value === ""
-                            ? null
-                            : event.target.value === "yes"
-                              ? true
-                              : false,
-                      }))
-                    }
-                  >
-                    <option value="">Not set</option>
-                    <option value="yes">Yes</option>
-                    <option value="no">No</option>
-                  </select>
-                </label>
-                <p className="hint">
-                  Roof overview photos: {photoCountsBySection.roof_overview}/{REQUIRED_PHOTO_COUNTS.roofOverview}
-                </p>
-                {missingRequiredPhotos.roofOverview > 0 ? (
-                  <p className="hint">
-                    Warning only: you are short {missingRequiredPhotos.roofOverview} roof overview photo(s).
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
-
-            {inspectionFlowStep.key === "roof_components" ? (
-              <div className="stack">
-                {COMPONENT_PRESENCE_KEYS.map((componentKey) => {
-                  const entry = inspectionChecklist.componentPresence[componentKey] ?? {
-                    present: false,
-                    quantity: null,
-                  };
-                  return (
-                    <div key={componentKey} className="job-card">
-                      <div className="row">
-                        <strong>{componentKey.replaceAll("_", " ")}</strong>
-                        <label className="row">
-                          <span>Present</span>
-                          <input
-                            type="checkbox"
-                            style={{ width: "auto" }}
-                            checked={entry.present}
-                            onChange={(event) => updateInspectionComponent(componentKey, event.target.checked)}
-                          />
-                        </label>
-                      </div>
-                      {entry.present ? (
-                        <label className="stack">
-                          Quantity
-                          <input
-                            inputMode="numeric"
-                            min={0}
-                            value={entry.quantity ?? ""}
-                            onChange={(event) =>
-                              updateInspectionComponentQuantity(componentKey, event.target.value)
-                            }
-                          />
-                        </label>
-                      ) : null}
-                    </div>
-                  );
-                })}
-              </div>
-            ) : null}
-
-            {inspectionFlowStep.key === "roof_damage" ? (
-              <div className="stack">
-                <label className="stack">
-                  Roof damage photo
-                  <input
-                    type="file"
-                    accept="image/jpeg,image/png"
-                    onChange={(event) => {
-                      setRoofDamagePhotoDraft((previous) => ({
-                        ...previous,
-                        file: event.target.files?.[0] ?? null,
-                      }));
-                      event.currentTarget.value = "";
-                    }}
-                  />
-                </label>
-                {roofDamagePhotoDraft.file ? (
-                  <p className="hint">Selected: {roofDamagePhotoDraft.file.name}</p>
-                ) : (
-                  <p className="hint">Select or capture one photo, then save.</p>
-                )}
-                <label className="stack">
-                  Damage type (optional)
-                  <select
-                    value={roofDamagePhotoDraft.damageCause}
-                    onChange={(event) =>
-                      setRoofDamagePhotoDraft((previous) => ({
-                        ...previous,
-                        damageCause: event.target.value as DamageCause,
-                      }))
-                    }
-                  >
-                    <option value="none">None</option>
-                    <option value="hail">Hail</option>
-                    <option value="wind">Wind</option>
-                    <option value="other">Other</option>
-                  </select>
-                </label>
-                <label className="stack">
-                  Slope (optional)
-                  <select
-                    value={roofDamagePhotoDraft.slopeTag}
-                    onChange={(event) =>
-                      setRoofDamagePhotoDraft((previous) => ({
-                        ...previous,
-                        slopeTag: event.target.value as DamageSlope | "",
-                      }))
-                    }
-                  >
-                    <option value="">Not set</option>
-                    <option value="front">Front</option>
-                    <option value="rear">Rear</option>
-                    <option value="left">Left</option>
-                    <option value="right">Right</option>
-                    <option value="other">Other</option>
-                  </select>
-                </label>
-                <label className="stack">
-                  Component tag (optional)
-                  <input
-                    value={roofDamagePhotoDraft.componentTag}
-                    onChange={(event) =>
-                      setRoofDamagePhotoDraft((previous) => ({ ...previous, componentTag: event.target.value }))
-                    }
-                  />
-                </label>
-                <label className="stack">
-                  Free-text tag (optional)
-                  <input
-                    value={roofDamagePhotoDraft.customTag}
-                    onChange={(event) =>
-                      setRoofDamagePhotoDraft((previous) => ({ ...previous, customTag: event.target.value }))
-                    }
-                  />
-                </label>
-                <label className="stack">
-                  Note (optional)
-                  <input
-                    value={roofDamagePhotoDraft.note}
-                    onChange={(event) =>
-                      setRoofDamagePhotoDraft((previous) => ({ ...previous, note: event.target.value }))
-                    }
-                  />
-                </label>
-                <div className="row">
-                  <button
-                    type="button"
-                    disabled={!roofDamagePhotoDraft.file}
-                    onClick={() => {
-                      const saved = addQuickTaggedPhoto(roofDamagePhotoDraft, "roof_damage");
-                      if (!saved) return;
-                      setRoofDamagePhotoDraft((previous) => ({
-                        ...previous,
-                        file: null,
-                        note: "",
-                        customTag: "",
-                        componentTag: "",
-                      }));
-                    }}
-                  >
-                    Save Roof Damage Photo
-                  </button>
-                </div>
-                <p className="hint">
-                  Roof damage photos: {photoCountsBySection.roof_damage}/{REQUIRED_PHOTO_COUNTS.roofDamage}
-                </p>
-                {missingRequiredPhotos.roofDamage > 0 ? (
-                  <p className="hint">
-                    Warning only: you are short {missingRequiredPhotos.roofDamage} roof damage photo(s).
-                  </p>
-                ) : null}
-              </div>
-            ) : null}
-
-            {inspectionFlowStep.key === "interior_attic" ? (
-              <>
-                <label className="row">
-                  <span>Interior inspected</span>
-                  <input
-                    type="checkbox"
-                    style={{ width: "auto" }}
-                    checked={inspectionChecklist.interiorStatus === "completed"}
-                    onChange={(event) =>
-                      setInspectionChecklist((previous) => ({
-                        ...previous,
-                        interiorStatus: event.target.checked ? "completed" : "skipped",
-                      }))
-                    }
-                  />
-                </label>
-                {inspectionChecklist.interiorStatus === "skipped" ? (
-                  <label className="stack">
-                    Interior skip reason (required)
-                    <input
-                      value={inspectionChecklist.interiorSkipReason}
-                      onChange={(event) =>
-                        setInspectionChecklist((previous) => ({
-                          ...previous,
-                          interiorSkipReason: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                ) : (
-                  <p className="hint">Interior marked complete.</p>
-                )}
-
-                <label className="row">
-                  <span>Attic inspected</span>
-                  <input
-                    type="checkbox"
-                    style={{ width: "auto" }}
-                    checked={inspectionChecklist.atticStatus === "completed"}
-                    onChange={(event) =>
-                      setInspectionChecklist((previous) => ({
-                        ...previous,
-                        atticStatus: event.target.checked ? "completed" : "skipped",
-                      }))
-                    }
-                  />
-                </label>
-                {inspectionChecklist.atticStatus === "skipped" ? (
-                  <label className="stack">
-                    Attic skip reason (required)
-                    <input
-                      value={inspectionChecklist.atticSkipReason}
-                      onChange={(event) =>
-                        setInspectionChecklist((previous) => ({
-                          ...previous,
-                          atticSkipReason: event.target.value,
-                        }))
-                      }
-                    />
-                  </label>
-                ) : (
-                  <p className="hint">Attic marked complete.</p>
-                )}
-              </>
-            ) : null}
-
-            {inspectionFlowStep.key === "report_signature" ? (
-              <>
-                <label className="stack">
-                  Rep signature name *
-                  <input
-                    value={inspectionChecklist.signatureRepName}
-                    onChange={(event) =>
-                      setInspectionChecklist((previous) => ({
-                        ...previous,
-                        signatureRepName: event.target.value,
-                      }))
-                    }
-                    required
-                  />
-                </label>
-                <label className="row">
-                  <span>Contingency signed</span>
-                  <input
-                    type="checkbox"
-                    style={{ width: "auto" }}
-                    checked={inspectionChecklist.contingent}
-                    onChange={(event) =>
-                      setInspectionChecklist((previous) => ({
-                        ...previous,
-                        contingent: event.target.checked,
-                      }))
-                    }
-                  />
-                </label>
-                <label className="stack">
-                  Final notes
-                  <textarea
-                    rows={3}
-                    value={inspectionChecklist.notes}
-                    onChange={(event) =>
-                      setInspectionChecklist((previous) => ({ ...previous, notes: event.target.value }))
-                    }
-                  />
-                </label>
-
-                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Saved Signatures</h3>
-                {loadingSignatures ? <p className="hint">Loading signatures...</p> : null}
-                {repSignatures.length > 0 ? (
-                  <div className="grid">
-                    {repSignatures.map((signature) => (
-                      <label key={signature.id} className="row">
-                        <span>{signature.label || "Saved signature"}</span>
-                        <input
-                          type="radio"
-                          name="rep-signature"
-                          style={{ width: "auto" }}
-                          checked={inspectionChecklist.selectedSignatureId === signature.id}
-                          onChange={() =>
-                            setInspectionChecklist((previous) => ({
-                              ...previous,
-                              selectedSignatureId: signature.id,
-                            }))
-                          }
-                        />
-                      </label>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="hint">No saved signatures yet.</p>
-                )}
-
-                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Draw Signature</h3>
-                <canvas
-                  ref={signatureCanvasRef}
-                  width={420}
-                  height={160}
-                  style={{
-                    width: "100%",
-                    maxWidth: 420,
-                    border: "1px solid var(--border)",
-                    borderRadius: 8,
-                    background: "#fff",
-                    touchAction: "none",
+            {/* ── Section drawers ──────────────────────────── */}
+            {activeHubSection && activeHubSection !== "roof" ? (
+              <div className="hub-drawer-overlay">
+                <SectionDrawer
+                  config={{
+                    key: activeHubSection,
+                    label: activeHubSection.charAt(0).toUpperCase() + activeHubSection.slice(1),
+                    captureSection: activeHubSection as CaptureSection,
+                    suggestedPhotoCount: activeHubSection === "perimeter" ? 8 : undefined,
+                    hideCondition: activeHubSection === "perimeter",
                   }}
-                  onPointerDown={startSignatureStroke}
-                  onPointerMove={moveSignatureStroke}
-                  onPointerUp={endSignatureStroke}
-                  onPointerLeave={endSignatureStroke}
+                  photos={inspectionPhotos.filter((p) => p.captureSection === activeHubSection)}
+                  condition={hubSectionStates[activeHubSection]?.condition ?? null}
+                  note={hubSectionStates[activeHubSection]?.note ?? ""}
+                  manualComplete={hubSectionStates[activeHubSection]?.manualComplete ?? false}
+                  onClose={() => setActiveHubSection(null)}
+                  onAddPhotos={(files, tags, section) => addPhotosFromHub(files, tags, section)}
+                  onRemovePhoto={(photoId) => setInspectionPhotos((prev) => prev.filter((p) => p.id !== photoId))}
+                  onConditionChange={(c) => updateHubSection(activeHubSection, { condition: c })}
+                  onNoteChange={(n) => updateHubSection(activeHubSection, { note: n })}
+                  onToggleManualComplete={() =>
+                    updateHubSection(activeHubSection, {
+                      manualComplete: !(hubSectionStates[activeHubSection]?.manualComplete ?? false),
+                    })
+                  }
                 />
-                <div className="row">
-                  <button type="button" className="secondary" onClick={clearDrawnSignature}>
-                    Clear Drawing
-                  </button>
-                  <button type="button" className="secondary" onClick={() => void saveDrawnSignature()} disabled={savingSignature}>
-                    {savingSignature ? "Saving..." : "Save As Reusable Signature"}
-                  </button>
-                </div>
-
-                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Inspection Report Includes</h3>
-                <div className="grid">
-                  {(Object.keys(DEFAULT_REPORT_SECTION_SELECTION) as Array<keyof ReportSectionSelection>).map(
-                    (sectionKey) => (
-                      <label key={sectionKey} className="row">
-                        <span>{sectionKey.replace(/([A-Z])/g, " $1").toLowerCase()}</span>
-                        <input
-                          type="checkbox"
-                          style={{ width: "auto" }}
-                          checked={reportSectionSelection[sectionKey]}
-                          onChange={(event) =>
-                            setReportSectionSelection((previous) => ({
-                              ...previous,
-                              [sectionKey]: event.target.checked,
-                            }))
-                          }
-                        />
-                      </label>
-                    ),
-                  )}
-                </div>
-                <h3 style={{ margin: "4px 0 0", fontSize: "1rem" }}>Photos Included In Report</h3>
-                <div className="grid">
-                  {inspectionPhotos.map((photo) => (
-                    <label key={photo.id} className="row">
-                      <span>{photo.file.name}</span>
-                      <input
-                        type="checkbox"
-                        style={{ width: "auto" }}
-                        checked={reportPhotoSelection[photo.id] !== false}
-                        onChange={(event) =>
-                          setReportPhotoSelection((previous) => ({
-                            ...previous,
-                            [photo.id]: event.target.checked,
-                          }))
-                        }
-                      />
-                    </label>
-                  ))}
-                  {inspectionPhotos.length === 0 ? (
-                    <p className="hint">No photos captured yet.</p>
-                  ) : null}
-                </div>
-                {photoRequirementWarnings.length > 0 ? (
-                  <p className="hint">
-                    Warning only: {photoRequirementWarnings.join(" | ")}.
-                  </p>
-                ) : null}
-              </>
+              </div>
             ) : null}
 
-            <div className="row" style={{ marginTop: 8 }}>
-              <button type="button" className="secondary" onClick={() => setStep("homeowner")}>
-                Back To Homeowner
+            {/* ── Roof sub-hub ─────────────────────────────── */}
+            {showRoofHub ? (
+              <div className="hub-drawer-overlay">
+                <RoofSubHub
+                  photos={inspectionPhotos.filter((p) =>
+                    ["roof_overview", "roof_damage", "roof_damage_test_square"].includes(p.captureSection),
+                  )}
+                  shingleLengthInches={inspectionChecklist.shingleLengthInches}
+                  shingleWidthInches={inspectionChecklist.shingleWidthInches}
+                  dripEdgePresent={
+                    inspectionChecklist.dripEdgePresent === true
+                      ? "yes"
+                      : inspectionChecklist.dripEdgePresent === false
+                        ? "no"
+                        : null
+                  }
+                  estimatedRoofAgeYears={estimatedRoofAgeYears}
+                  layerCount={layerCount}
+                  layerPhotoId={layerPhotoId}
+                  componentPresence={inspectionChecklist.componentPresence}
+                  roofDamage={roofDamageHub}
+                  onClose={() => setShowRoofHub(false)}
+                  onAddPhotos={async (files, tags, section) => {
+                    return await addPhotosFromHub(files, tags, section);
+                  }}
+                  onRemovePhoto={(photoId) =>
+                    setInspectionPhotos((prev) => prev.filter((p) => p.id !== photoId))
+                  }
+                  onShingleLength={(v) =>
+                    setInspectionChecklist((prev) => ({ ...prev, shingleLengthInches: v }))
+                  }
+                  onShingleWidth={(v) =>
+                    setInspectionChecklist((prev) => ({ ...prev, shingleWidthInches: v }))
+                  }
+                  onDripEdge={(v) =>
+                    setInspectionChecklist((prev) => ({
+                      ...prev,
+                      dripEdgePresent: v === "yes" ? true : v === "no" ? false : null,
+                    }))
+                  }
+                  onRoofAge={setEstimatedRoofAgeYears}
+                  onLayerCount={setLayerCount}
+                  onLayerPhoto={setLayerPhotoId}
+                  onComponentToggle={updateInspectionComponent}
+                  onComponentQty={updateInspectionComponentQuantity}
+                  onRoofDamage={(patch) => setRoofDamageHub((prev) => ({ ...prev, ...patch }))}
+                />
+              </div>
+            ) : null}
+
+            {/* ── Report builder ───────────────────────────── */}
+            {showReportBuilder ? (
+              <ReportBuilder
+                photos={inspectionPhotos}
+                initialPayload={reportBuilderPayload}
+                repSignatures={repSignatures as RBRepSignatureRow[]}
+                loadingSignatures={loadingSignatures}
+                generating={saving}
+                onClose={() => setShowReportBuilder(false)}
+                onGenerate={(payload) => {
+                  setReportBuilderPayload(payload);
+                  setInspectionChecklist((prev) => ({
+                    ...prev,
+                    contingent: payload.contingent,
+                    notes: payload.closing.notes || prev.notes,
+                    selectedSignatureId: payload.signatureId,
+                  }));
+                  setShowReportBuilder(false);
+                  if (photoRequirementWarnings.length > 0) {
+                    setMessage(`Warning: ${photoRequirementWarnings.join(" | ")}. Submitting anyway.`);
+                  }
+                  void logEvent({
+                    action: "knock",
+                    outcome: "inspection",
+                    homeownerRequired: true,
+                    contingentOverride: payload.contingent,
+                  });
+                }}
+              />
+            ) : null}
+
+            {/* ── Persistent hub footer ────────────────────── */}
+            <div className="hub-footer">
+              <button
+                type="button"
+                className="hub-footer-btn"
+                onClick={() => updateHubSection("perimeter", { note: (hubSectionStates.perimeter?.note ?? "") + " " })}
+              >
+                📝 Notes
               </button>
               <button
                 type="button"
-                className="secondary"
-                onClick={goToPreviousInspectionStep}
-                disabled={inspectionStepIndex === 0}
+                className="hub-footer-btn hub-footer-btn--primary"
+                onClick={() => setShowReportBuilder(true)}
+                disabled={saving}
               >
-                Previous Step
+                {saving ? "Saving…" : "Generate Report →"}
               </button>
-              {inspectionFlowStep.key === "report_signature" ? (
-                <button type="submit" disabled={saving}>
-                  {saving ? "Saving..." : "Complete Inspection"}
-                </button>
-              ) : (
-                <button type="submit" disabled={saving}>
-                  Next Step
-                </button>
-              )}
             </div>
-          </form>
+          </div>
         ) : null}
       </section>
 
