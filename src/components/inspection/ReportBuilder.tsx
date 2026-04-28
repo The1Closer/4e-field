@@ -19,7 +19,7 @@ type Props = {
   initialPayload: ReportBuilderPayload;
   repSignatures: RepSignatureRow[];
   loadingSignatures: boolean;
-  onGenerate: (payload: ReportBuilderPayload) => void;
+  onGenerate: (payload: ReportBuilderPayload) => void | Promise<void>;
   onClose: () => void;
   generating: boolean;
 };

@@ -661,6 +661,7 @@ export async function POST(request: NextRequest, context: RouteContext) {
     }
 
     // ── PHOTO GALLERY ─────────────────────────────────────────────────────────
+    const photoFailures: string[] = [];
     if (limitedRows.length > 0) {
       const unsupportedPhotos: string[] = [];
       type EmbeddedRow = { row: InspectionPhotoRow; image: PDFImage | null };
@@ -672,11 +673,15 @@ export async function POST(request: NextRequest, context: RouteContext) {
           const dl = await supabase.storage.from("inspection-media").download(row.file_path);
           if (dl.error || !dl.data) {
             console.warn(JSON.stringify({ event: "pdf_photo_download_failed", file: row.file_name, error: dl.error?.message }));
+            photoFailures.push(row.file_name);
             return { row, image: null };
           }
           const bytes = new Uint8Array(await dl.data.arrayBuffer());
           const image = await embedImage(doc, bytes, row.content_type, row.file_name);
-          if (!image) unsupportedPhotos.push(row.file_name);
+          if (!image) {
+            unsupportedPhotos.push(row.file_name);
+            photoFailures.push(row.file_name);
+          }
           return { row, image };
         }));
         embeddedRows.push(...results);
@@ -764,16 +769,26 @@ export async function POST(request: NextRequest, context: RouteContext) {
     const pdfBytes = await doc.save({ useObjectStreams: true });
     const fileName = `inspection-report-${inspectionId}.pdf`;
 
+    const responseHeaders: Record<string, string> = {
+      "Content-Type": "application/pdf",
+      "Content-Disposition": `inline; filename="${fileName}"`,
+      "X-Report-File-Name": fileName,
+    };
+    if (photoFailures.length > 0) {
+      // Cap the header value at a reasonable size (~1.5KB) to avoid header limits.
+      const joined = photoFailures.slice(0, 40).join(",");
+      responseHeaders["X-Report-Photo-Failures"] = joined;
+    }
     return new NextResponse(Buffer.from(pdfBytes), {
       status: 200,
-      headers: {
-        "Content-Type": "application/pdf",
-        "Content-Disposition": `inline; filename="${fileName}"`,
-        "X-Report-File-Name": fileName,
-      },
+      headers: responseHeaders,
     });
   } catch (error) {
-    console.error(JSON.stringify({ event: "inspection_pdf_error", error: error instanceof Error ? error.message : String(error) }));
+    console.error(JSON.stringify({
+      level: "error",
+      route: "/api/inspections/[id]/report/pdf",
+      message: error instanceof Error ? error.message : String(error),
+    }));
     return NextResponse.json({ error: "Failed to generate report PDF." }, { status: 500 });
   }
 }

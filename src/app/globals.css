@@ -1759,7 +1759,44 @@ button.danger:hover {
   overflow: hidden;
   background: var(--background);
 }
-.h3d-canvas-wrap canvas { touch-action: pan-y; }
+@media (max-width: 640px) {
+  .h3d-canvas-wrap { height: 420px; min-height: 420px; }
+}
+.h3d-canvas-wrap canvas {
+  touch-action: none;
+  overscroll-behavior: contain;
+}
+
+/* Floating zoom controls overlaid on the 3D canvas */
+.h3d-zoom-controls {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 5;
+}
+.h3d-zoom-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  font-size: 18px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  backdrop-filter: blur(4px);
+}
+.h3d-zoom-btn:hover { background: rgba(0, 0, 0, 0.7); }
+.h3d-zoom-btn:active { transform: scale(0.94); }
+.h3d-zoom-btn--reset { font-size: 16px; }
 .h3d-canvas-wrap--loading {
   background: linear-gradient(135deg, var(--panel-soft) 0%, var(--panel) 100%);
   position: relative;
@@ -1890,22 +1927,25 @@ button.danger:hover {
 .ec-picker-overlay {
   position: fixed; inset: 0;
   background: var(--shell-overlay-bg);
-  display: flex; align-items: flex-end; justify-content: center;
+  display: flex; align-items: center; justify-content: center;
   z-index: 220;
   padding: 16px;
+  padding-bottom: max(16px, env(safe-area-inset-bottom));
   backdrop-filter: blur(4px);
+  overscroll-behavior: contain;
 }
-@media (min-width: 600px) { .ec-picker-overlay { align-items: center; } }
 .ec-picker-dialog {
   background: var(--shell-panel-bg);
   border: 1px solid var(--border);
   border-radius: 14px;
   width: 100%; max-width: 540px;
-  max-height: 80vh;
+  max-height: 80dvh;
   display: flex; flex-direction: column;
   overflow: hidden;
   box-shadow: var(--shadow-panel);
+  overscroll-behavior: contain;
 }
+.ec-picker-grid-wrap { -webkit-overflow-scrolling: touch; }
 .ec-picker-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 18px; border-bottom: 1px solid var(--border);

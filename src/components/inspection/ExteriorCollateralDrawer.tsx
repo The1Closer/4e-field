@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type {
   DamageCause,
   ExteriorCollateralItem,
@@ -60,6 +60,23 @@ export default function ExteriorCollateralDrawer({
   const [pickerSearch, setPickerSearch] = useState("");
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [cameraItemId, setCameraItemId] = useState<string | null>(null);
+  const pickerSearchRef = useRef<HTMLInputElement | null>(null);
+
+  // Lock body scroll while the type picker is open so the soft keyboard can't
+  // shift the underlying page on mobile, and delay focus until the dialog is
+  // laid out so iOS/Android don't jank the viewport.
+  useEffect(() => {
+    if (!showPicker) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusTimer = window.setTimeout(() => {
+      pickerSearchRef.current?.focus({ preventScroll: true });
+    }, 140);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.clearTimeout(focusTimer);
+    };
+  }, [showPicker]);
 
   const groupedTypes = useMemo(() => {
     const q = pickerSearch.trim().toLowerCase();
@@ -295,12 +312,14 @@ export default function ExteriorCollateralDrawer({
                 </button>
               </div>
               <input
+                ref={pickerSearchRef}
                 className="ec-picker-search"
                 type="text"
+                inputMode="search"
+                enterKeyHint="search"
                 placeholder="Search types…"
                 value={pickerSearch}
                 onChange={(e) => setPickerSearch(e.target.value)}
-                autoFocus
               />
               <div className="ec-picker-grid-wrap">
                 {Object.entries(groupedTypes).map(([group, types]) => (

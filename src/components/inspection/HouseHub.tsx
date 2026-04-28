@@ -19,6 +19,7 @@ type Props = {
   onTap: (key: HubSectionKey) => void;
   onAddDetached?: () => void;
   suggestedNext?: HubSectionKey | null;
+  labelsVisible?: boolean;
 };
 
 export default function HouseHub(props: Props) {
@@ -27,7 +28,10 @@ export default function HouseHub(props: Props) {
     return <div className="hub-house-wrap h3d-canvas-wrap h3d-canvas-wrap--loading" />;
   }
   if (support === "unsupported") {
-    return <House2D {...props} />;
+    // House2D doesn't render floating labels — labelsVisible is harmless to pass through.
+    const { labelsVisible: _omit, ...fallbackProps } = props;
+    void _omit;
+    return <House2D {...fallbackProps} />;
   }
   return <House3D {...props} />;
 }

@@ -160,6 +160,13 @@ type RepSignatureRow = JsonRecord & {
   created_at?: string | null;
 };
 
+type ReportPipelineStep = "pdf" | "upload" | "metadata";
+
+type ReportFailure = {
+  step: ReportPipelineStep;
+  message: string;
+};
+
 type InspectionCompletionModalState = {
   open: boolean;
   eventAddress: string;
@@ -174,6 +181,10 @@ type InspectionCompletionModalState = {
   inspectionId: string | null;
   selectedPhotoIds: string[];
   reportPayload: Record<string, unknown>;
+  clientReportId: string | null;
+  reportFailure: ReportFailure | null;
+  reportFilePath: string | null;
+  photoFailures: string[];
 };
 
 type InspectionChecklist = {
@@ -601,7 +612,63 @@ export default function KnockingPage() {
     inspectionId: null,
     selectedPhotoIds: [],
     reportPayload: {},
+    clientReportId: null,
+    reportFailure: null,
+    reportFilePath: null,
+    photoFailures: [],
   });
+  const generatingReportRef = useRef(false);
+  const [reportToast, setReportToast] = useState<{ kind: "success" | "info"; text: string } | null>(null);
+
+  // Persist completion modal metadata (without bytes/blob URL) to localStorage so a refresh
+  // mid-flow doesn't lose access to the saved report's status + retry handles.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!completionModal.open || !completionModal.inspectionId) return;
+    try {
+      const persisted = {
+        eventAddress: completionModal.eventAddress,
+        title: completionModal.title,
+        reportId: completionModal.reportId,
+        fileName: completionModal.fileName,
+        uploadStatus: completionModal.uploadStatus,
+        uploadError: completionModal.uploadError,
+        linkedJobId: completionModal.linkedJobId,
+        inspectionId: completionModal.inspectionId,
+        selectedPhotoIds: completionModal.selectedPhotoIds,
+        reportPayload: completionModal.reportPayload,
+        clientReportId: completionModal.clientReportId,
+        reportFailure: completionModal.reportFailure,
+        reportFilePath: completionModal.reportFilePath,
+        photoFailures: completionModal.photoFailures,
+      };
+      window.localStorage.setItem(
+        `inspection:report-completion:${completionModal.inspectionId}`,
+        JSON.stringify(persisted),
+      );
+    } catch {
+      // localStorage may be full / disabled — non-fatal.
+    }
+  }, [completionModal]);
+
+  // Beforeunload guard while a report generation is in flight.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (!generatingReportRef.current) return;
+      e.preventDefault();
+      e.returnValue = "Report still generating — leave anyway?";
+    }
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, []);
+
+  // Auto-dismiss success/info toasts after 4s.
+  useEffect(() => {
+    if (!reportToast) return;
+    const timer = window.setTimeout(() => setReportToast(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [reportToast]);
 
   const watchIdRef = useRef<number | null>(null);
   const currentAddressRef = useRef("");
@@ -1077,10 +1144,20 @@ export default function KnockingPage() {
       inspectionId: null,
       selectedPhotoIds: [],
       reportPayload: {},
+      clientReportId: null,
+      reportFailure: null,
+      reportFilePath: null,
+      photoFailures: [],
     });
     if (eventAddress) {
       resetAfterEvent(eventAddress);
     }
+  }
+
+  function withFetchTimeout(ms: number): { signal: AbortSignal; cancel: () => void } {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), ms);
+    return { signal: controller.signal, cancel: () => window.clearTimeout(timer) };
   }
 
   async function uploadReportPdfToCrm(
@@ -1138,46 +1215,74 @@ export default function KnockingPage() {
     selectedPhotoIds: string[];
     payload: Record<string, unknown>;
     accessTokenValue: string;
+    clientReportId?: string;
   }) {
-    const pdfResponse = await fetch(`/api/inspections/${params.inspectionId}/report/pdf`, {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${params.accessTokenValue}`,
-      },
-      body: JSON.stringify({
-        title: params.title,
-        selectedPhotoIds: params.selectedPhotoIds,
-        payload: params.payload,
-      }),
-    });
+    const { signal, cancel } = withFetchTimeout(60_000);
+    let pdfResponse: Response;
+    try {
+      pdfResponse = await fetch(`/api/inspections/${params.inspectionId}/report/pdf`, {
+        method: "POST",
+        credentials: "include",
+        signal,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${params.accessTokenValue}`,
+        },
+        body: JSON.stringify({
+          title: params.title,
+          selectedPhotoIds: params.selectedPhotoIds,
+          payload: params.payload,
+          clientReportId: params.clientReportId,
+        }),
+      });
+    } catch (fetchErr) {
+      if (fetchErr instanceof Error && fetchErr.name === "AbortError") {
+        throw new Error("PDF generation timed out — the server is slow or unreachable. Tap retry to try again.");
+      }
+      throw fetchErr;
+    } finally {
+      cancel();
+    }
     if (!pdfResponse.ok) {
       const pdfErrorPayload = (await pdfResponse.json().catch(() => ({}))) as { error?: string };
       throw new Error(pdfErrorPayload.error || "Could not generate inspection PDF.");
     }
     const fileName =
       pdfResponse.headers.get("x-report-file-name")?.trim() || `inspection-report-${params.inspectionId}.pdf`;
+    const photoFailuresHeader = pdfResponse.headers.get("x-report-photo-failures");
+    const photoFailures = photoFailuresHeader
+      ? photoFailuresHeader
+          .split(",")
+          .map((value) => value.trim())
+          .filter((value) => value.length > 0)
+      : [];
     const bytes = await pdfResponse.arrayBuffer();
-    return { fileName, bytes };
+    return { fileName, bytes, photoFailures };
   }
 
   async function retryCompletionReportUpload() {
     if (!completionModal.open || !completionModal.linkedJobId || !completionModal.inspectionId || !accessToken) {
       return;
     }
+    if (generatingReportRef.current) return;
+    generatingReportRef.current = true;
     setSaving(true);
     setError(null);
+    const clientReportId = completionModal.clientReportId ?? undefined;
     try {
       let pdfBytes = completionModal.pdfBytes;
       let fileName = completionModal.fileName;
-      if (!pdfBytes || !fileName) {
+      // PDF-step retry: regenerate if missing or if last failure was at the PDF step.
+      const needsPdf =
+        !pdfBytes || !fileName || completionModal.reportFailure?.step === "pdf";
+      if (needsPdf) {
         const regenerated = await generateInspectionPdf({
           inspectionId: completionModal.inspectionId,
           title: completionModal.title,
           selectedPhotoIds: completionModal.selectedPhotoIds,
           payload: completionModal.reportPayload,
           accessTokenValue: accessToken,
+          clientReportId,
         });
         pdfBytes = regenerated.bytes;
         fileName = regenerated.fileName;
@@ -1189,6 +1294,7 @@ export default function KnockingPage() {
             fileName,
             pdfBytes,
             pdfUrl: refreshedUrl,
+            photoFailures: regenerated.photoFailures,
           };
         });
       }
@@ -1196,75 +1302,70 @@ export default function KnockingPage() {
       const uploadMeta = await uploadReportPdfToCrm(
         completionModal.linkedJobId,
         fileName,
-        pdfBytes,
+        pdfBytes!,
         accessToken,
       );
-      if (completionModal.reportId) {
-        const { error: reportUpdateError } = await supabase
-          .from("inspection_reports")
-          .update({
-            file_name: completionModal.fileName,
-            file_path: uploadMeta.filePath,
-            content_type: "application/pdf",
-            size_bytes: uploadMeta.sizeBytes,
-            crm_document_id: uploadMeta.crmDocumentId,
-            crm_job_id: uploadMeta.crmJobId,
-            payload: {
-              ...completionModal.reportPayload,
-              upload_status: "uploaded",
-              upload_error: null,
-            },
-          })
-          .eq("id", completionModal.reportId)
-          .eq("inspection_id", completionModal.inspectionId)
-          .eq("rep_id", user?.id ?? "");
-        if (reportUpdateError) {
-          throw new Error(reportUpdateError.message || "CRM upload succeeded but report update failed.");
-        }
-      } else {
-        const retryReportResponse = await fetch(`/api/inspections/${completionModal.inspectionId}/report`, {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title: completionModal.title,
-            linkedJobId: completionModal.linkedJobId,
-            selectedPhotoIds: completionModal.selectedPhotoIds,
-            fileName,
-            filePath: uploadMeta.filePath,
-            contentType: "application/pdf",
-            sizeBytes: uploadMeta.sizeBytes,
-            crmDocumentId: uploadMeta.crmDocumentId,
-            crmJobId: uploadMeta.crmJobId,
-            payload: {
-              ...completionModal.reportPayload,
-              upload_status: "uploaded",
-              upload_error: null,
-            },
-          }),
-        });
-        if (!retryReportResponse.ok) {
-          const retryReportPayload = (await retryReportResponse.json().catch(() => ({}))) as {
-            error?: string;
-          };
-          throw new Error(retryReportPayload.error || "CRM upload succeeded but report record save failed.");
-        }
+
+      // Always go through the API upsert path so server-side enforces idempotency
+      // via (inspection_id, client_report_id).
+      const retryReportResponse = await fetch(`/api/inspections/${completionModal.inspectionId}/report`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+        body: JSON.stringify({
+          title: completionModal.title,
+          linkedJobId: completionModal.linkedJobId,
+          selectedPhotoIds: completionModal.selectedPhotoIds,
+          fileName,
+          filePath: uploadMeta.filePath,
+          contentType: "application/pdf",
+          sizeBytes: uploadMeta.sizeBytes,
+          crmDocumentId: uploadMeta.crmDocumentId,
+          crmJobId: uploadMeta.crmJobId,
+          clientReportId,
+          payload: {
+            ...completionModal.reportPayload,
+            upload_status: "uploaded",
+            upload_error: null,
+          },
+        }),
+      });
+      if (!retryReportResponse.ok) {
+        const retryReportPayload = (await retryReportResponse.json().catch(() => ({}))) as {
+          error?: string;
+        };
+        throw new Error(retryReportPayload.error || "CRM upload succeeded but report record save failed.");
       }
+      const retryReportPayload = (await retryReportResponse.json().catch(() => ({}))) as {
+        report?: { id: string };
+      };
       setCompletionModal((previous) => ({
         ...previous,
+        reportId: retryReportPayload.report?.id ?? previous.reportId,
         uploadStatus: "uploaded",
         uploadError: null,
+        reportFailure: null,
+        reportFilePath: uploadMeta.filePath,
       }));
+      setReportToast({ kind: "success", text: "✓ Report saved" });
       setMessage("PDF uploaded to CRM successfully.");
     } catch (retryError) {
+      const message = parseError(retryError, "Retry failed.");
+      // Determine which step failed for the retry by looking at the prior failure
+      // and the message — we keep the prior step if available so the UI knows.
       setCompletionModal((previous) => ({
         ...previous,
         uploadStatus: "failed",
-        uploadError: parseError(retryError, "Retry failed."),
+        uploadError: message,
+        reportFailure: {
+          step: previous.reportFailure?.step ?? "upload",
+          message,
+        },
       }));
-      setError(parseError(retryError, "Could not retry CRM PDF upload."));
+      setError(parseError(retryError, "Could not retry inspection report."));
     } finally {
       setSaving(false);
+      generatingReportRef.current = false;
     }
   }
 
@@ -2566,7 +2667,14 @@ export default function KnockingPage() {
           let crmJobId: string | null = linkedJobId;
           let reportFilePath = `${user.id}/reports/${inspectionRecordId}/${Date.now()}-${reportFileName}`;
           let reportSizeBytes: number | null = null;
+          let pipelineFailure: ReportFailure | null = null;
+          let pipelinePhotoFailures: string[] = [];
+          const clientReportId =
+            typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+              ? crypto.randomUUID()
+              : `${inspectionRecordId}-${Date.now()}`;
 
+          // Step 1 — PDF generation. Hard fail (block downstream) on error.
           try {
             const generatedPdf = await generateInspectionPdf({
               inspectionId: inspectionRecordId,
@@ -2574,20 +2682,25 @@ export default function KnockingPage() {
               selectedPhotoIds,
               payload: reportPayloadData,
               accessTokenValue: accessToken,
+              clientReportId,
             });
             reportFileName = generatedPdf.fileName;
             reportBytes = generatedPdf.bytes;
             reportSizeBytes = reportBytes.byteLength;
+            pipelinePhotoFailures = generatedPdf.photoFailures;
           } catch (reportGenerationErrorValue) {
             reportUploadStatus = "failed";
             reportUploadError = parseError(
               reportGenerationErrorValue,
               "Could not generate inspection PDF.",
             );
+            pipelineFailure = { step: "pdf", message: reportUploadError };
             postSaveWarnings.push(`Inspection PDF generation failed: ${reportUploadError}`);
           }
 
-          if (reportBytes) {
+          // Step 2 — CRM upload. If PDF succeeded but upload fails, keep going so we still
+          // persist a metadata row marked failed; user can retry upload from the modal.
+          if (!pipelineFailure && reportBytes) {
             try {
               const uploadMeta = await uploadReportPdfToCrm(linkedJobId, reportFileName, reportBytes, accessToken);
               reportFilePath = uploadMeta.filePath;
@@ -2597,47 +2710,57 @@ export default function KnockingPage() {
             } catch (reportUploadErrorValue) {
               reportUploadStatus = "failed";
               reportUploadError = parseError(reportUploadErrorValue, "Could not upload PDF to CRM job files.");
+              pipelineFailure = { step: "upload", message: reportUploadError };
               postSaveWarnings.push(`Inspection PDF upload pending retry: ${reportUploadError}`);
             }
           }
 
-          const reportRecordResponse = await fetch(`/api/inspections/${inspectionRecordId}/report`, {
-            method: "POST",
-            credentials: "include",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${accessToken}`,
-            },
-            body: JSON.stringify({
-              title: "Inspection Report",
-              linkedJobId,
-              selectedPhotoIds,
-              fileName: reportFileName,
-              filePath: reportFilePath,
-              contentType: "application/pdf",
-              sizeBytes: reportSizeBytes ?? undefined,
-              crmDocumentId,
-              crmJobId,
-              payload: {
-                ...reportPayloadData,
-                upload_status: reportUploadStatus,
-                upload_error: reportUploadError,
-              },
-            }),
-          });
-          const reportRecordPayload = (await reportRecordResponse.json().catch(() => ({}))) as {
-            error?: string;
-            report?: { id: string };
-          };
-          if (!reportRecordResponse.ok || !reportRecordPayload.report?.id) {
-            postSaveWarnings.push(
-              `Inspection report metadata save failed: ${
-                reportRecordPayload.error || "Could not create inspection report record."
-              }`,
-            );
-          } else {
-            inspectionReportId = reportRecordPayload.report.id;
+          // Step 3 — Metadata save. Always attempted when we have PDF bytes, even if upload failed.
+          if (reportBytes) {
+            try {
+              const reportRecordResponse = await fetch(`/api/inspections/${inspectionRecordId}/report`, {
+                method: "POST",
+                credentials: "include",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${accessToken}`,
+                },
+                body: JSON.stringify({
+                  title: "Inspection Report",
+                  linkedJobId,
+                  selectedPhotoIds,
+                  fileName: reportFileName,
+                  filePath: reportFilePath,
+                  contentType: "application/pdf",
+                  sizeBytes: reportSizeBytes ?? undefined,
+                  crmDocumentId,
+                  crmJobId,
+                  clientReportId,
+                  payload: {
+                    ...reportPayloadData,
+                    upload_status: reportUploadStatus,
+                    upload_error: reportUploadError,
+                  },
+                }),
+              });
+              const reportRecordPayload = (await reportRecordResponse.json().catch(() => ({}))) as {
+                error?: string;
+                report?: { id: string };
+              };
+              if (!reportRecordResponse.ok || !reportRecordPayload.report?.id) {
+                const metadataMessage = reportRecordPayload.error || "Could not create inspection report record.";
+                postSaveWarnings.push(`Inspection report metadata save failed: ${metadataMessage}`);
+                if (!pipelineFailure) pipelineFailure = { step: "metadata", message: metadataMessage };
+              } else {
+                inspectionReportId = reportRecordPayload.report.id;
+              }
+            } catch (metadataError) {
+              const metadataMessage = parseError(metadataError, "Could not save inspection report metadata.");
+              postSaveWarnings.push(`Inspection report metadata save failed: ${metadataMessage}`);
+              if (!pipelineFailure) pipelineFailure = { step: "metadata", message: metadataMessage };
+            }
           }
+
           const reportUrl = reportBytes
             ? URL.createObjectURL(new Blob([reportBytes], { type: "application/pdf" }))
             : null;
@@ -2655,6 +2778,10 @@ export default function KnockingPage() {
             inspectionId: inspectionRecordId,
             selectedPhotoIds,
             reportPayload: reportPayloadData,
+            clientReportId,
+            reportFailure: pipelineFailure,
+            reportFilePath,
+            photoFailures: pipelinePhotoFailures,
           };
 
           const summary =
@@ -2830,6 +2957,14 @@ export default function KnockingPage() {
 
       if (completionModalState) {
         setCompletionModal(completionModalState);
+        if (!completionModalState.reportFailure && completionModalState.uploadStatus === "uploaded") {
+          setReportToast({ kind: "success", text: "✓ Report saved" });
+        } else if (completionModalState.reportFailure) {
+          setReportToast({
+            kind: "info",
+            text: `Report ${completionModalState.reportFailure.step} step failed — retry below.`,
+          });
+        }
       } else {
         resetAfterEvent(eventAddress);
       }
@@ -3319,6 +3454,7 @@ export default function KnockingPage() {
 
             {/* ── House Hub ──────────────────────────────────── */}
             <HouseHub
+              labelsVisible={!showRoofHub && !showReportBuilder && !activeHubSection && !activeDetachedId && !showGeneralNotes}
               hotspots={([
                 { key: "roof", label: "Roof" },
                 { key: "perimeter", label: "Perimeter" },
@@ -3624,7 +3760,9 @@ export default function KnockingPage() {
                 loadingSignatures={loadingSignatures}
                 generating={saving}
                 onClose={() => setShowReportBuilder(false)}
-                onGenerate={(payload) => {
+                onGenerate={async (payload) => {
+                  if (generatingReportRef.current) return;
+                  generatingReportRef.current = true;
                   setReportBuilderPayload(payload);
                   setInspectionChecklist((prev) => ({
                     ...prev,
@@ -3632,16 +3770,23 @@ export default function KnockingPage() {
                     notes: payload.closing.notes || prev.notes,
                     selectedSignatureId: payload.signatureId,
                   }));
-                  setShowReportBuilder(false);
                   if (photoRequirementWarnings.length > 0) {
                     setMessage(`Warning: ${photoRequirementWarnings.join(" | ")}. Submitting anyway.`);
                   }
-                  void logEvent({
-                    action: "knock",
-                    outcome: "inspection",
-                    homeownerRequired: true,
-                    contingentOverride: payload.contingent,
-                  });
+                  try {
+                    await logEvent({
+                      action: "knock",
+                      outcome: "inspection",
+                      homeownerRequired: true,
+                      contingentOverride: payload.contingent,
+                    });
+                    // Only close the builder once logEvent has finished. completionModal
+                    // either succeeds (✅ toast) or shows a step-specific retry inside the
+                    // sticky banner below the hub.
+                    setShowReportBuilder(false);
+                  } finally {
+                    generatingReportRef.current = false;
+                  }
                 }}
               />
             ) : null}
@@ -3698,17 +3843,53 @@ export default function KnockingPage() {
           <div className="row">
             <h2 style={{ margin: 0 }}>Inspection Complete</h2>
             <span className="hint">
-              CRM Upload: {completionModal.uploadStatus === "uploaded" ? "Uploaded" : "Needs Retry"}
+              {completionModal.reportFailure
+                ? `${completionModal.reportFailure.step.toUpperCase()} step failed`
+                : completionModal.uploadStatus === "uploaded"
+                  ? "Saved"
+                  : "Needs Retry"}
             </span>
           </div>
-          {completionModal.uploadError ? <p className="error">{completionModal.uploadError}</p> : null}
+          {completionModal.reportFailure ? (
+            <p className="error" style={{ marginTop: 4 }}>
+              <strong>
+                {completionModal.reportFailure.step === "pdf"
+                  ? "PDF generation failed."
+                  : completionModal.reportFailure.step === "upload"
+                    ? "CRM upload failed."
+                    : "Report metadata save failed."}
+              </strong>{" "}
+              {completionModal.reportFailure.message}
+            </p>
+          ) : completionModal.uploadError ? (
+            <p className="error">{completionModal.uploadError}</p>
+          ) : null}
+          {completionModal.photoFailures.length > 0 ? (
+            <p className="hint" style={{ color: "var(--warn, #d6b37a)" }}>
+              {completionModal.photoFailures.length} photo
+              {completionModal.photoFailures.length === 1 ? "" : "s"} couldn&apos;t be embedded.
+            </p>
+          ) : null}
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-            <button type="button" onClick={downloadCompletionPdf}>
-              Download PDF
-            </button>
-            {completionModal.uploadStatus !== "uploaded" ? (
-              <button type="button" className="secondary" onClick={() => void retryCompletionReportUpload()} disabled={saving}>
-                {saving ? "Retrying..." : "Retry CRM Upload"}
+            {completionModal.pdfUrl ? (
+              <button type="button" onClick={downloadCompletionPdf}>
+                Download PDF
+              </button>
+            ) : null}
+            {completionModal.reportFailure || completionModal.uploadStatus !== "uploaded" ? (
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => void retryCompletionReportUpload()}
+                disabled={saving}
+              >
+                {saving
+                  ? "Retrying..."
+                  : completionModal.reportFailure?.step === "pdf"
+                    ? "Retry Full Report"
+                    : completionModal.reportFailure?.step === "metadata"
+                      ? "Retry Save"
+                      : "Retry CRM Upload"}
               </button>
             ) : null}
             <button type="button" className="secondary" onClick={closeCompletionModal}>
@@ -3732,6 +3913,30 @@ export default function KnockingPage() {
             <p className="hint">Preview unavailable. Use download instead.</p>
           )}
         </section>
+      ) : null}
+
+      {reportToast ? (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: "fixed",
+            left: "50%",
+            bottom: 24,
+            transform: "translateX(-50%)",
+            zIndex: 1500,
+            background: reportToast.kind === "success" ? "#2f8a46" : "#7a5e2a",
+            color: "#fff",
+            padding: "10px 18px",
+            borderRadius: 12,
+            boxShadow: "0 6px 24px rgba(0,0,0,0.4)",
+            fontWeight: 600,
+            fontSize: 14,
+            letterSpacing: 0.3,
+          }}
+        >
+          {reportToast.text}
+        </div>
       ) : null}
 
       <section className="knock-card">

@@ -7,6 +7,8 @@ import * as THREE from "three";
 import type { HotspotInfo } from "@/components/inspection/StructureHotspot";
 import type { HubSectionKey } from "@/types/inspection";
 import { hotspotColor, hotspotEmissive, type ScenePalette } from "./theme-palette";
+import { SECTION_ANGLES, shortestAngleDiff, useHouseControls } from "./useHouseControls";
+import { useLawnTexture, useShingleTexture, useStuccoTexture } from "./procedural-textures";
 
 type HotspotMeshProps = {
   hkey: HubSectionKey;
@@ -16,18 +18,28 @@ type HotspotMeshProps = {
   palette: ScenePalette;
   suggested: boolean;
   onTap: (key: HubSectionKey) => void;
-  visible?: boolean; // defaults to true for the overlay; the underlying form element renders separately
   showLabel?: boolean;
+  labelsVisible?: boolean;
+  showArrow?: boolean;
 };
 
-function Hotspot({ hkey, position, size, hotspot, palette, suggested, onTap, showLabel = true }: HotspotMeshProps) {
+function Hotspot({
+  hkey,
+  position,
+  size,
+  hotspot,
+  palette,
+  suggested,
+  onTap,
+  showLabel = true,
+  labelsVisible = true,
+  showArrow = false,
+}: HotspotMeshProps) {
   const ref = useRef<THREE.Mesh>(null);
   const pulseRef = useRef<THREE.Mesh>(null);
+  const arrowRef = useRef<HTMLDivElement>(null);
   const [hovered, setHovered] = React.useState(false);
-  if (!hotspot) return null;
-  const color = hotspotColor(hotspot.state, palette);
-  const emissive = hotspotEmissive(hotspot.state) + (hovered ? 0.2 : 0);
-  const isComplete = hotspot.state === "complete" || hotspot.state === "override_complete";
+  const ctx = useHouseControls();
 
   useFrame((_state, delta) => {
     if (suggested && pulseRef.current) {
@@ -41,24 +53,43 @@ function Hotspot({ hkey, position, size, hotspot, palette, suggested, onTap, sho
         m.opacity = 0.7;
       }
     }
+    if (showArrow && arrowRef.current) {
+      const t = (performance.now() / 300) % (Math.PI * 2);
+      arrowRef.current.style.transform = `translateY(${Math.sin(t) * 4}px)`;
+    }
   });
+
+  if (!hotspot) return null;
+  const color = hotspotColor(hotspot.state, palette);
+  const emissive = hotspotEmissive(hotspot.state) + (hovered ? 0.2 : 0);
+  const isComplete = hotspot.state === "complete" || hotspot.state === "override_complete";
+
+  // Dim completed sections so "what's left" reads instantly.
+  const baseOpacity =
+    hotspot.state === "untouched" ? 0.18 : isComplete ? 0.12 : 0.32;
 
   return (
     <group position={position}>
       <mesh
         ref={ref}
+        onPointerDown={(e) => {
+          e.stopPropagation();
+          ctx?.noteInteraction();
+        }}
         onClick={(e) => {
           e.stopPropagation();
-          onTap(hkey);
+          ctx?.requestSnap(hkey);
+          // Stagger drawer open by ~220ms so the snap-lerp completes visibly.
+          window.setTimeout(() => onTap(hkey), 220);
         }}
         onPointerOver={(e) => {
           e.stopPropagation();
           setHovered(true);
-          document.body.style.cursor = "pointer";
+          if (typeof document !== "undefined") document.body.style.cursor = "pointer";
         }}
         onPointerOut={() => {
           setHovered(false);
-          document.body.style.cursor = "auto";
+          if (typeof document !== "undefined") document.body.style.cursor = "auto";
         }}
       >
         <boxGeometry args={size} />
@@ -67,7 +98,7 @@ function Hotspot({ hkey, position, size, hotspot, palette, suggested, onTap, sho
           emissive={color}
           emissiveIntensity={emissive}
           transparent
-          opacity={hotspot.state === "untouched" ? 0.18 : 0.32}
+          opacity={baseOpacity}
           depthWrite={false}
         />
         <Edges threshold={15} color={color} />
@@ -78,8 +109,8 @@ function Hotspot({ hkey, position, size, hotspot, palette, suggested, onTap, sho
           <meshBasicMaterial color={palette.brandPulse} transparent opacity={0.7} side={THREE.DoubleSide} />
         </mesh>
       ) : null}
-      {isComplete ? (
-        <Html center distanceFactor={10} position={[0, size[1] / 2 + 0.4, 0]}>
+      {labelsVisible && isComplete ? (
+        <Html center distanceFactor={10} position={[0, size[1] / 2 + 0.4, 0]} zIndexRange={[40, 30]}>
           <div
             style={{
               color: "#fff",
@@ -100,11 +131,17 @@ function Hotspot({ hkey, position, size, hotspot, palette, suggested, onTap, sho
           </div>
         </Html>
       ) : null}
-      {showLabel ? (
-        <Html center distanceFactor={12} position={[0, 0, 0]} style={{ pointerEvents: "none" }}>
+      {labelsVisible && showLabel ? (
+        <Html
+          center
+          distanceFactor={12}
+          position={[0, 0, 0]}
+          style={{ pointerEvents: "none" }}
+          zIndexRange={[40, 30]}
+        >
           <div
             style={{
-              color: color,
+              color,
               fontSize: 11,
               fontWeight: 600,
               letterSpacing: 0.3,
@@ -118,6 +155,30 @@ function Hotspot({ hkey, position, size, hotspot, palette, suggested, onTap, sho
           </div>
         </Html>
       ) : null}
+      {labelsVisible && showArrow ? (
+        <Html
+          center
+          distanceFactor={9}
+          position={[0, size[1] / 2 + 1.0, 0]}
+          style={{ pointerEvents: "none" }}
+          zIndexRange={[40, 30]}
+        >
+          <div
+            ref={arrowRef}
+            style={{
+              color: palette.brandPulse,
+              fontSize: 22,
+              fontWeight: 900,
+              filter: `drop-shadow(0 1px 3px rgba(0,0,0,0.6))`,
+              pointerEvents: "none",
+              userSelect: "none",
+              lineHeight: 1,
+            }}
+          >
+            ▼
+          </div>
+        </Html>
+      ) : null}
     </group>
   );
 }
@@ -127,22 +188,44 @@ type Props = {
   onTap: (key: HubSectionKey) => void;
   suggestedNext?: HubSectionKey | null;
   palette: ScenePalette;
+  labelsVisible?: boolean;
 };
 
-export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: Props) {
-  const rootRef = useRef<THREE.Group>(null);
+export default function HouseScene({ hotspots, onTap, suggestedNext, palette, labelsVisible = true }: Props) {
+  const fallbackRef = useRef<THREE.Group | null>(null);
+  const ctx = useHouseControls();
+  const groupRef = ctx?.groupRef ?? fallbackRef;
   const smokeRefs = useRef<THREE.Mesh[]>([]);
 
   const get = (k: HubSectionKey) => hotspots.find((h) => h.key === k);
 
-  // Gentle idle rotation
+  // Snap-to-section lerp + idle drift after ~4 s of no interaction.
   useFrame((_, delta) => {
-    if (rootRef.current) rootRef.current.rotation.y += delta * 0.05;
-    // Animate chimney smoke puffs
+    const group = groupRef.current;
+    if (group) {
+      if (ctx) {
+        if (ctx.targetYRef.current !== null) {
+          const cur = group.rotation.y;
+          const tgt = ctx.targetYRef.current;
+          const diff = shortestAngleDiff(tgt, cur);
+          if (Math.abs(diff) < 0.005) {
+            group.rotation.y = tgt;
+            ctx.targetYRef.current = null;
+          } else {
+            group.rotation.y = cur + diff * Math.min(1, delta * 6);
+          }
+        } else if (typeof performance !== "undefined" && performance.now() - ctx.lastInteractionRef.current > 4000) {
+          group.rotation.y += delta * 0.012;
+        }
+      } else {
+        // No controls context (legacy / tests): keep the original gentle spin.
+        group.rotation.y += delta * 0.05;
+      }
+    }
     smokeRefs.current.forEach((mesh, i) => {
       if (!mesh) return;
       const offset = i * 0.7;
-      const t = ((performance.now() / 1000) + offset) % 3;
+      const t = (performance.now() / 1000 + offset) % 3;
       mesh.position.y = 4.5 + t * 0.6;
       mesh.scale.setScalar(0.18 + t * 0.06);
       const mat = mesh.material as THREE.MeshBasicMaterial;
@@ -150,7 +233,6 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
     });
   });
 
-  // Window glass material — uses transmission for that subtle refraction look
   const glassMaterial = useMemo(
     () =>
       new THREE.MeshPhysicalMaterial({
@@ -166,12 +248,16 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
     [palette.windowGlass],
   );
 
+  const stucco = useStuccoTexture(palette.walls);
+  const shingle = useShingleTexture(palette.roof, palette.roofAccent);
+  const lawn = useLawnTexture(palette.ground);
+
   return (
-    <group ref={rootRef}>
+    <group ref={groupRef}>
       {/* GROUND / LAWN */}
       <mesh position={[0, 0, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
         <planeGeometry args={[28, 22]} />
-        <meshStandardMaterial color={palette.ground} roughness={0.95} />
+        <meshStandardMaterial color={palette.ground} roughness={0.95} map={lawn ?? undefined} />
       </mesh>
 
       {/* SIDEWALK strip */}
@@ -189,12 +275,12 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
       {/* WALLS */}
       <mesh position={[0, 2.3, 0]} castShadow receiveShadow>
         <boxGeometry args={[9.6, 3.8, 6.6]} />
-        <meshStandardMaterial color={palette.walls} roughness={0.7} />
+        <meshStandardMaterial color={palette.walls} roughness={0.7} map={stucco ?? undefined} />
         <Edges threshold={20} color={palette.trim} />
       </mesh>
 
-      {/* HIP ROOF — built from a custom geometry */}
-      <HipRoof palette={palette} />
+      {/* HIP ROOF */}
+      <HipRoof palette={palette} shingle={shingle} />
 
       {/* CHIMNEY */}
       <mesh position={[2.9, 5.7, -0.6]} castShadow>
@@ -202,16 +288,16 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
         <meshStandardMaterial color={palette.chimney} roughness={0.85} />
         <Edges threshold={15} color={palette.trim} />
       </mesh>
-      {/* Chimney cap */}
       <mesh position={[2.9, 6.55, -0.6]}>
         <boxGeometry args={[0.85, 0.12, 0.85]} />
         <meshStandardMaterial color={palette.trim} roughness={0.6} />
       </mesh>
-      {/* Smoke puffs */}
       {[0, 1, 2].map((i) => (
         <mesh
           key={i}
-          ref={(el) => { if (el) smokeRefs.current[i] = el; }}
+          ref={(el) => {
+            if (el) smokeRefs.current[i] = el;
+          }}
           position={[2.9, 4.5, -0.6]}
         >
           <sphereGeometry args={[0.18, 12, 12]} />
@@ -222,16 +308,13 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
       {/* FRONT WINDOWS — left & right of door */}
       {[-2.6, 2.6].map((x) => (
         <group key={x} position={[x, 2.6, 3.31]}>
-          {/* frame */}
           <mesh>
             <boxGeometry args={[1.5, 1.4, 0.08]} />
             <meshStandardMaterial color={palette.windowFrame} roughness={0.5} />
           </mesh>
-          {/* glass */}
           <mesh position={[0, 0, 0.05]} material={glassMaterial}>
             <planeGeometry args={[1.3, 1.2]} />
           </mesh>
-          {/* mullion cross */}
           <mesh position={[0, 0, 0.06]}>
             <boxGeometry args={[0.05, 1.2, 0.02]} />
             <meshStandardMaterial color={palette.windowFrame} />
@@ -250,7 +333,6 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
           <meshStandardMaterial color={palette.door} roughness={0.55} />
           <Edges threshold={20} color={palette.trim} />
         </mesh>
-        {/* Door knob */}
         <mesh position={[0.45, 0, 0.07]}>
           <sphereGeometry args={[0.07, 12, 12]} />
           <meshStandardMaterial color={palette.brand} metalness={0.3} roughness={0.4} />
@@ -270,22 +352,30 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
       </group>
 
       {/* HOUSE-NUMBER PLATE */}
-      <Html position={[0, 3.2, 3.36]} center distanceFactor={8} style={{ pointerEvents: "none" }}>
-        <div
-          style={{
-            background: palette.brand,
-            color: "#fff",
-            padding: "2px 8px",
-            borderRadius: 4,
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: 1,
-            boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
-          }}
+      {labelsVisible ? (
+        <Html
+          position={[0, 3.2, 3.36]}
+          center
+          distanceFactor={8}
+          style={{ pointerEvents: "none" }}
+          zIndexRange={[40, 30]}
         >
-          4E
-        </div>
-      </Html>
+          <div
+            style={{
+              background: palette.brand,
+              color: "#fff",
+              padding: "2px 8px",
+              borderRadius: 4,
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: 1,
+              boxShadow: "0 1px 3px rgba(0,0,0,0.3)",
+            }}
+          >
+            4E
+          </div>
+        </Html>
+      ) : null}
 
       {/* AC CONDENSER (left side) */}
       <group position={[-5.4, 0.6, 1.2]}>
@@ -294,12 +384,10 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
           <meshStandardMaterial color={palette.ac} roughness={0.8} metalness={0.1} />
           <Edges threshold={15} color={palette.trim} />
         </mesh>
-        {/* Fan disc on top */}
         <mesh position={[0, 0.62, 0]} rotation={[-Math.PI / 2, 0, 0]}>
           <cylinderGeometry args={[0.42, 0.42, 0.04, 24]} />
           <meshStandardMaterial color={palette.acFins} roughness={0.6} />
         </mesh>
-        {/* Fins */}
         {[-0.3, -0.15, 0, 0.15, 0.3].map((y) => (
           <mesh key={y} position={[0, y, 0.51]}>
             <boxGeometry args={[0.95, 0.04, 0.02]} />
@@ -320,7 +408,6 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
             <meshStandardMaterial color={palette.trim} />
           </mesh>
         ))}
-        {/* Fence posts */}
         {[-1.4, 1.4].map((z) => (
           <mesh key={z} position={[0.7, 0.6, z]}>
             <boxGeometry args={[0.1, 1.2, 0.1]} />
@@ -353,60 +440,194 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette }: 
         </mesh>
       </group>
 
-      {/* HOTSPOTS — overlay rectangles on the visual elements */}
-      {/* ROOF — large area above the walls */}
-      <Hotspot hkey="roof" position={[0, 5.4, 0]} size={[10, 0.4, 7]} hotspot={get("roof")} palette={palette} suggested={suggestedNext === "roof"} onTap={onTap} />
-      {/* GUTTERS — strip at eave line */}
-      <Hotspot hkey="gutters" position={[0, 4.25, 0]} size={[10.4, 0.18, 7.4]} hotspot={get("gutters")} palette={palette} suggested={suggestedNext === "gutters"} onTap={onTap} />
-      {/* SIDING — front-left wall */}
-      <Hotspot hkey="siding" position={[-2.4, 2.8, 3.32]} size={[3.6, 2, 0.05]} hotspot={get("siding")} palette={palette} suggested={suggestedNext === "siding"} onTap={onTap} />
-      {/* WINDOWS — front-right wall area */}
-      <Hotspot hkey="windows" position={[2.6, 2.7, 3.32]} size={[3.6, 2.4, 0.05]} hotspot={get("windows")} palette={palette} suggested={suggestedNext === "windows"} onTap={onTap} />
-      {/* INTERIOR — center over the door area */}
-      <Hotspot hkey="interior" position={[0, 1.9, 3.32]} size={[2, 2.6, 0.05]} hotspot={get("interior")} palette={palette} suggested={suggestedNext === "interior"} onTap={onTap} />
+      {/* HOTSPOTS — overlay rectangles. Sized so siding never covers windows. */}
+      {/* ROOF */}
+      <Hotspot
+        hkey="roof"
+        position={[0, 5.4, 0]}
+        size={[10, 0.4, 7]}
+        hotspot={get("roof")}
+        palette={palette}
+        suggested={suggestedNext === "roof"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "roof"}
+      />
+      {/* GUTTERS — thin band at eave line */}
+      <Hotspot
+        hkey="gutters"
+        position={[0, 4.25, 0]}
+        size={[10.4, 0.12, 7.4]}
+        hotspot={get("gutters")}
+        palette={palette}
+        suggested={suggestedNext === "gutters"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "gutters"}
+      />
+      {/* SIDING — left wall plane (primary label here) */}
+      <Hotspot
+        hkey="siding"
+        position={[-4.85, 2.3, 0]}
+        size={[0.04, 3.6, 6.5]}
+        hotspot={get("siding")}
+        palette={palette}
+        suggested={suggestedNext === "siding"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "siding"}
+      />
+      {/* SIDING — right wall plane (no label) */}
+      <Hotspot
+        hkey="siding"
+        position={[4.85, 2.3, 0]}
+        size={[0.04, 3.6, 6.5]}
+        hotspot={get("siding")}
+        palette={palette}
+        suggested={suggestedNext === "siding"}
+        onTap={onTap}
+        showLabel={false}
+        labelsVisible={labelsVisible}
+      />
+      {/* SIDING — front top band between window-tops and eave */}
+      <Hotspot
+        hkey="siding"
+        position={[0, 3.85, 3.33]}
+        size={[7.4, 0.6, 0.04]}
+        hotspot={get("siding")}
+        palette={palette}
+        suggested={suggestedNext === "siding"}
+        onTap={onTap}
+        showLabel={false}
+        labelsVisible={labelsVisible}
+      />
+      {/* SIDING — front bottom band between foundation and sills */}
+      <Hotspot
+        hkey="siding"
+        position={[0, 0.7, 3.33]}
+        size={[7.4, 0.5, 0.04]}
+        hotspot={get("siding")}
+        palette={palette}
+        suggested={suggestedNext === "siding"}
+        onTap={onTap}
+        showLabel={false}
+        labelsVisible={labelsVisible}
+      />
+      {/* WINDOWS — left glass, no label (right one carries label) */}
+      <Hotspot
+        hkey="windows"
+        position={[-2.6, 2.6, 3.36]}
+        size={[1.55, 1.45, 0.04]}
+        hotspot={get("windows")}
+        palette={palette}
+        suggested={suggestedNext === "windows"}
+        onTap={onTap}
+        showLabel={false}
+        labelsVisible={labelsVisible}
+      />
+      {/* WINDOWS — right glass, primary label */}
+      <Hotspot
+        hkey="windows"
+        position={[2.6, 2.6, 3.36]}
+        size={[1.55, 1.45, 0.04]}
+        hotspot={get("windows")}
+        palette={palette}
+        suggested={suggestedNext === "windows"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "windows"}
+      />
+      {/* INTERIOR — door area only */}
+      <Hotspot
+        hkey="interior"
+        position={[0, 1.55, 3.36]}
+        size={[1.4, 2.5, 0.04]}
+        hotspot={get("interior")}
+        palette={palette}
+        suggested={suggestedNext === "interior"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "interior"}
+      />
       {/* ATTIC — gable triangle area */}
-      <Hotspot hkey="attic" position={[0, 5.4, 3.1]} size={[3, 0.6, 0.4]} hotspot={get("attic")} palette={palette} suggested={suggestedNext === "attic"} onTap={onTap} />
-      {/* PERSONAL PROPERTY — right window cluster (interior contents) */}
-      <Hotspot hkey="personal_property" position={[2.6, 2.7, -3.32]} size={[3.6, 2.4, 0.05]} hotspot={get("personal_property")} palette={palette} suggested={suggestedNext === "personal_property"} onTap={onTap} />
+      <Hotspot
+        hkey="attic"
+        position={[0, 5.4, 3.1]}
+        size={[3, 0.6, 0.4]}
+        hotspot={get("attic")}
+        palette={palette}
+        suggested={suggestedNext === "attic"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "attic"}
+      />
+      {/* PERSONAL PROPERTY — back wall */}
+      <Hotspot
+        hkey="personal_property"
+        position={[2.6, 2.7, -3.32]}
+        size={[3.6, 2.4, 0.05]}
+        hotspot={get("personal_property")}
+        palette={palette}
+        suggested={suggestedNext === "personal_property"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "personal_property"}
+      />
       {/* PERIMETER — sidewalk */}
-      <Hotspot hkey="perimeter" position={[0, 0.05, 5]} size={[2.6, 0.05, 11.5]} hotspot={get("perimeter")} palette={palette} suggested={suggestedNext === "perimeter"} onTap={onTap} />
-      {/* EXTERIOR COLLATERAL — wraps AC and deck side hints */}
-      <Hotspot hkey="exterior_collateral" position={[-5.4, 0.7, 1.2]} size={[1.5, 1.6, 1.5]} hotspot={get("exterior_collateral")} palette={palette} suggested={suggestedNext === "exterior_collateral"} onTap={onTap} />
-      <Hotspot hkey="exterior_collateral" position={[5.4, 0.7, -0.5]} size={[1.8, 1.4, 3.4]} hotspot={get("exterior_collateral")} palette={palette} suggested={suggestedNext === "exterior_collateral"} onTap={onTap} showLabel={false} />
+      <Hotspot
+        hkey="perimeter"
+        position={[0, 0.05, 5]}
+        size={[2.6, 0.05, 11.5]}
+        hotspot={get("perimeter")}
+        palette={palette}
+        suggested={suggestedNext === "perimeter"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "perimeter"}
+      />
+      {/* EXTERIOR COLLATERAL — AC + deck side hints */}
+      <Hotspot
+        hkey="exterior_collateral"
+        position={[-5.4, 0.7, 1.2]}
+        size={[1.5, 1.6, 1.5]}
+        hotspot={get("exterior_collateral")}
+        palette={palette}
+        suggested={suggestedNext === "exterior_collateral"}
+        onTap={onTap}
+        labelsVisible={labelsVisible}
+        showArrow={suggestedNext === "exterior_collateral"}
+      />
+      <Hotspot
+        hkey="exterior_collateral"
+        position={[5.4, 0.7, -0.5]}
+        size={[1.8, 1.4, 3.4]}
+        hotspot={get("exterior_collateral")}
+        palette={palette}
+        suggested={suggestedNext === "exterior_collateral"}
+        onTap={onTap}
+        showLabel={false}
+        labelsVisible={labelsVisible}
+      />
     </group>
   );
 }
 
-function HipRoof({ palette }: { palette: ScenePalette }) {
-  // Hip roof = 4-faceted pyramid-like shape over the rectangular walls.
-  // Wall span: 9.6 x 6.6 at y=4.2 (top of walls). Apex at y=5.6.
+function HipRoof({ palette, shingle }: { palette: ScenePalette; shingle: THREE.CanvasTexture | null }) {
   const geometry = useMemo(() => {
-    const halfW = 5.0; // overhang slightly past 4.8
-    const halfD = 3.5; // overhang slightly past 3.3
-    const ridgeHalf = 1.5; // ridge runs along x for hip roof
+    const halfW = 5.0;
+    const halfD = 3.5;
+    const ridgeHalf = 1.5;
     const apexY = 1.6;
 
     const vertices = new Float32Array([
-      // 8 base corners (4 outer, top-of-wall) + 2 ridge points
-      // 0: front-left base
       -halfW, 0, halfD,
-      // 1: front-right base
       halfW, 0, halfD,
-      // 2: back-right base
       halfW, 0, -halfD,
-      // 3: back-left base
       -halfW, 0, -halfD,
-      // 4: ridge front
       -ridgeHalf, apexY, 0,
-      // 5: ridge back (shifted along x to make a hip ridge)
       ridgeHalf, apexY, 0,
     ]);
 
-    // Triangle faces — hip roof has 2 trapezoidal sides (split into triangles) + 2 triangular ends
-    // Front face: 0, 1, 5 + 0, 5, 4
-    // Right end: 1, 2, 5
-    // Back face: 2, 3, 4 + 2, 4, 5
-    // Left end: 3, 0, 4
     const indices = new Uint16Array([
       0, 1, 5,
       0, 5, 4,
@@ -425,7 +646,12 @@ function HipRoof({ palette }: { palette: ScenePalette }) {
 
   return (
     <mesh position={[0, 4.2, 0]} geometry={geometry} castShadow receiveShadow>
-      <meshStandardMaterial color={palette.roof} roughness={0.78} side={THREE.DoubleSide} />
+      <meshStandardMaterial
+        color={palette.roof}
+        roughness={0.78}
+        side={THREE.DoubleSide}
+        map={shingle ?? undefined}
+      />
       <Edges threshold={15} color={palette.trim} />
     </mesh>
   );
