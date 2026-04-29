@@ -245,6 +245,16 @@ export type ReportSectionSelection = {
   summaryNotes: boolean;
 };
 
+// ── Building footprint (cached per inspection) ──────────────────────────────
+export type BuildingFootprint = {
+  /** Polygon ring as [lng, lat] pairs, closed (first === last). */
+  polygon: Array<[number, number]>;
+  /** Polygon centroid in [lng, lat]. */
+  centroid: [number, number];
+  source: "osm";
+  fetchedAt: string;
+};
+
 // ── Inspection metadata shape (new hub fields) ────────────────────────────────
 export type InspectionHubMetadata = {
   guidedFlowVersion: "v3";
@@ -265,4 +275,5 @@ export type InspectionHubMetadata = {
   signatureId: string | null;
   signaturePath: string | null;
   reportBuilder: ReportBuilderPayload | null;
+  buildingFootprint?: BuildingFootprint | null;
 };

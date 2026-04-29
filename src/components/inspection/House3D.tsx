@@ -4,12 +4,16 @@ import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } fr
 import { Canvas } from "@react-three/fiber";
 import { ContactShadows, Environment, PresentationControls, Sky } from "@react-three/drei";
 import * as THREE from "three";
-import type { HubSectionKey } from "@/types/inspection";
+import type { BuildingFootprint, HubSectionKey } from "@/types/inspection";
 import { useThemeIsLight } from "@/lib/use-webgl-support";
 import HouseScene from "@/lib/three/HouseScene";
 import { paletteForTheme } from "@/lib/three/theme-palette";
 import { HouseControlsCtx, SECTION_ANGLES } from "@/lib/three/useHouseControls";
+import { footprintToHouseGeometry } from "@/lib/footprint/footprint-to-mesh";
 import type { HotspotInfo } from "./StructureHotspot";
+import ImageryBadge from "./ImageryBadge";
+
+type ImageryStatus = "idle" | "loading" | "ready" | "partial" | "failed";
 
 type Props = {
   hotspots: HotspotInfo[];
@@ -17,7 +21,60 @@ type Props = {
   onAddDetached?: () => void;
   suggestedNext?: HubSectionKey | null;
   labelsVisible?: boolean;
+  imageryStatus?: ImageryStatus;
+  satelliteUrl?: string | null;
+  streetViewUrl?: string | null;
+  /** Homeowner address (preferred input — geocoded server-side). */
+  address?: string | null;
+  /** Rep GPS — fallback when address isn't known. */
+  lat?: number | null;
+  lng?: number | null;
+  /** Pre-cached footprint from inspection metadata — skips re-fetch when present. */
+  cachedFootprint?: BuildingFootprint | null;
+  /** Called when a fresh footprint is fetched, so the parent can persist it. */
+  onFootprintFetched?: (footprint: BuildingFootprint | null) => void;
 };
+
+function useRemoteTexture(url: string | null | undefined): THREE.Texture | null {
+  const [texture, setTexture] = useState<THREE.Texture | null>(null);
+
+  useEffect(() => {
+    if (!url) {
+      setTexture(null);
+      return;
+    }
+    let cancelled = false;
+    let created: THREE.Texture | null = null;
+    const loader = new THREE.TextureLoader();
+    loader.setCrossOrigin("anonymous");
+    loader.load(
+      url,
+      (tex) => {
+        if (cancelled) {
+          tex.dispose();
+          return;
+        }
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = 8;
+        tex.minFilter = THREE.LinearMipmapLinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.needsUpdate = true;
+        created = tex;
+        setTexture(tex);
+      },
+      undefined,
+      () => {
+        if (!cancelled) setTexture(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+      if (created) created.dispose();
+    };
+  }, [url]);
+
+  return texture;
+}
 
 const ZOOM_MIN = 0.55;
 const ZOOM_MAX = 1.6;
@@ -34,10 +91,95 @@ function getInitialCamera(): { position: [number, number, number]; fov: number }
     : { position: [13, 10, 13], fov: 32 };
 }
 
-export default function House3D({ hotspots, onTap, onAddDetached, suggestedNext, labelsVisible = true }: Props) {
+export default function House3D({
+  hotspots,
+  onTap,
+  onAddDetached,
+  suggestedNext,
+  labelsVisible = true,
+  imageryStatus = "idle",
+  satelliteUrl,
+  streetViewUrl,
+  address,
+  lat,
+  lng,
+  cachedFootprint,
+  onFootprintFetched,
+}: Props) {
   const isLight = useThemeIsLight();
   const palette = useMemo(() => paletteForTheme(isLight), [isLight]);
   const initialCamera = useMemo(() => getInitialCamera(), []);
+
+  const satelliteTexture = useRemoteTexture(satelliteUrl);
+  const streetViewTexture = useRemoteTexture(streetViewUrl);
+
+  // Footprint state — start with the cached one if present, otherwise fetch.
+  const [footprint, setFootprint] = useState<BuildingFootprint | null>(cachedFootprint ?? null);
+  const fetchedKeyRef = useRef<string | null>(null);
+
+  // Hold the latest onFootprintFetched in a ref so the effect doesn't re-run
+  // (and tear down the in-flight fetch) every time the parent re-renders.
+  const onFootprintFetchedRef = useRef(onFootprintFetched);
+  useEffect(() => {
+    onFootprintFetchedRef.current = onFootprintFetched;
+  }, [onFootprintFetched]);
+
+  useEffect(() => {
+    if (cachedFootprint) {
+      setFootprint(cachedFootprint);
+      return;
+    }
+
+    const trimmedAddress = (address ?? "").trim();
+    const hasAddress = trimmedAddress.length > 0;
+    const hasCoords =
+      typeof lat === "number" && typeof lng === "number" && Number.isFinite(lat) && Number.isFinite(lng);
+
+    if (!hasAddress && !hasCoords) return;
+
+    // Key the fetch by address (or coords) so switching inspections re-fires.
+    const key = hasAddress
+      ? `addr:${trimmedAddress}`
+      : `gps:${(lat as number).toFixed(6)},${(lng as number).toFixed(6)}`;
+    if (fetchedKeyRef.current === key) return;
+    fetchedKeyRef.current = key;
+
+    // Hard client-side timeout — never let the fetch hang forever.
+    const controller = new AbortController();
+    const hardTimeout = setTimeout(() => controller.abort(), 12000);
+
+    (async () => {
+      try {
+        const payload: Record<string, unknown> = {};
+        if (hasAddress) payload.address = trimmedAddress;
+        if (hasCoords) {
+          payload.lat = lat;
+          payload.lng = lng;
+        }
+        const res = await fetch("/api/footprint", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        clearTimeout(hardTimeout);
+        if (!res.ok) return;
+        const data = (await res.json()) as { footprint: BuildingFootprint | null };
+        if (data.footprint) setFootprint(data.footprint);
+        onFootprintFetchedRef.current?.(data.footprint);
+      } catch {
+        clearTimeout(hardTimeout);
+        // Silent fallback to generic geometry.
+      }
+    })();
+    // No cleanup — fetch is allowed to outlive parent re-renders.
+  }, [address, lat, lng, cachedFootprint]);
+
+  const footprintGeometry = useMemo(
+    () => (footprint ? footprintToHouseGeometry(footprint) : null),
+    [footprint],
+  );
 
   const groupRef = useRef<THREE.Group | null>(null);
   const targetYRef = useRef<number | null>(null);
@@ -155,6 +297,9 @@ export default function House3D({ hotspots, onTap, onAddDetached, suggestedNext,
                   suggestedNext={suggestedNext}
                   palette={palette}
                   labelsVisible={labelsVisible}
+                  satelliteTexture={satelliteTexture}
+                  streetViewTexture={streetViewTexture}
+                  footprintGeometry={footprintGeometry}
                 />
               </group>
             </PresentationControls>
@@ -162,6 +307,8 @@ export default function House3D({ hotspots, onTap, onAddDetached, suggestedNext,
         </Suspense>
         <ContactShadows position={[0, 0.01, 0]} opacity={0.55} blur={2.0} far={15} scale={20} resolution={512} />
       </Canvas>
+
+      <ImageryBadge status={imageryStatus} />
 
       <div className="h3d-zoom-controls" aria-label="Zoom controls">
         <button type="button" className="h3d-zoom-btn" onClick={() => stepZoom(0.1)} aria-label="Zoom in">+</button>

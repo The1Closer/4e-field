@@ -9,6 +9,7 @@ import type { HubSectionKey } from "@/types/inspection";
 import { hotspotColor, hotspotEmissive, type ScenePalette } from "./theme-palette";
 import { SECTION_ANGLES, shortestAngleDiff, useHouseControls } from "./useHouseControls";
 import { useLawnTexture, useShingleTexture, useStuccoTexture } from "./procedural-textures";
+import type { FootprintHouseGeometry } from "@/lib/footprint/footprint-to-mesh";
 
 type HotspotMeshProps = {
   hkey: HubSectionKey;
@@ -189,18 +190,102 @@ type Props = {
   suggestedNext?: HubSectionKey | null;
   palette: ScenePalette;
   labelsVisible?: boolean;
+  satelliteTexture?: THREE.Texture | null;
+  streetViewTexture?: THREE.Texture | null;
+  footprintGeometry?: FootprintHouseGeometry | null;
 };
 
-export default function HouseScene({ hotspots, onTap, suggestedNext, palette, labelsVisible = true }: Props) {
+// Hotspot/decoration anchors that match today's hardcoded layout exactly.
+// Used when no footprint is available — visual fallback identical to before.
+type DefaultAnchors = {
+  hotspots: FootprintHouseGeometry["hotspots"];
+  decorations: FootprintHouseGeometry["decorations"];
+  frontFace: FootprintHouseGeometry["frontFace"];
+};
+
+const DEFAULT_ANCHORS: DefaultAnchors = {
+  hotspots: {
+    roof:               { position: [0, 5.4, 0],        size: [10, 0.4, 7] },
+    gutters:            { position: [0, 4.25, 0],       size: [10.4, 0.12, 7.4] },
+    sidingLeft:         { position: [-4.85, 2.3, 0],    size: [0.04, 3.6, 6.5] },
+    sidingRight:        { position: [4.85, 2.3, 0],     size: [0.04, 3.6, 6.5] },
+    sidingFrontTop:     { position: [0, 3.85, 3.33],    size: [7.4, 0.6, 0.04] },
+    sidingFrontBottom:  { position: [0, 0.7, 3.33],     size: [7.4, 0.5, 0.04] },
+    windowsLeft:        { position: [-2.6, 2.6, 3.36],  size: [1.55, 1.45, 0.04] },
+    windowsRight:       { position: [2.6, 2.6, 3.36],   size: [1.55, 1.45, 0.04] },
+    interior:           { position: [0, 1.55, 3.36],    size: [1.4, 2.5, 0.04] },
+    attic:              { position: [0, 5.4, 3.1],      size: [3, 0.6, 0.4] },
+    personalProperty:   { position: [2.6, 2.7, -3.32],  size: [3.6, 2.4, 0.05] },
+    perimeter:          { position: [0, 0.05, 5],       size: [2.6, 0.05, 11.5] },
+    exteriorCollateralLeft:  { position: [-5.4, 0.7, 1.2],  size: [1.5, 1.6, 1.5] },
+    exteriorCollateralRight: { position: [5.4, 0.7, -0.5],  size: [1.8, 1.4, 3.4] },
+  },
+  decorations: {
+    chimney: [2.9, 5.7, -0.6],
+    ac: [-5.4, 0.6, 1.2],
+    deck: [5.4, 0.15, -0.5],
+    mailbox: [3.6, 1, 5.5],
+    tree: [-4.5, 0, 6.5],
+    shrubs: [4, 0.4, 6],
+    sidewalkCenter: [0, 0.008, 5],
+  },
+  frontFace: {
+    center: [0, 2.3, 3.305],
+    width: 9.6,
+    height: 3.8,
+  },
+};
+
+export default function HouseScene({
+  hotspots,
+  onTap,
+  suggestedNext,
+  palette,
+  labelsVisible = true,
+  satelliteTexture,
+  streetViewTexture,
+  footprintGeometry,
+}: Props) {
+  const useFootprint = Boolean(footprintGeometry);
+  const anchors = footprintGeometry?.hotspots ?? DEFAULT_ANCHORS.hotspots;
+  const decoSpots = footprintGeometry?.decorations ?? DEFAULT_ANCHORS.decorations;
+  const frontFace = footprintGeometry?.frontFace ?? DEFAULT_ANCHORS.frontFace;
   const fallbackRef = useRef<THREE.Group | null>(null);
   const ctx = useHouseControls();
   const groupRef = ctx?.groupRef ?? fallbackRef;
   const smokeRefs = useRef<THREE.Mesh[]>([]);
+  const satelliteMatRef = useRef<THREE.MeshStandardMaterial | null>(null);
+  const streetViewMatRef = useRef<THREE.MeshBasicMaterial | null>(null);
+  const proceduralFrontMatsRef = useRef<THREE.Material[]>([]);
 
   const get = (k: HubSectionKey) => hotspots.find((h) => h.key === k);
+  const hasSatellite = Boolean(satelliteTexture);
+  const hasStreetView = Boolean(streetViewTexture);
 
-  // Snap-to-section lerp + idle drift after ~4 s of no interaction.
+  // Snap-to-section lerp, idle drift, and texture crossfade.
   useFrame((_, delta) => {
+    // Crossfade real imagery over the procedural fallback.
+    const FADE_RATE = delta * 1.8; // ~600ms fade
+    if (satelliteMatRef.current) {
+      const target = hasSatellite ? 1 : 0;
+      const m = satelliteMatRef.current;
+      m.opacity = Math.max(0, Math.min(1, m.opacity + Math.sign(target - m.opacity) * FADE_RATE));
+      m.needsUpdate = false;
+    }
+    if (streetViewMatRef.current) {
+      const target = hasStreetView ? 1 : 0;
+      const m = streetViewMatRef.current;
+      m.opacity = Math.max(0, Math.min(1, m.opacity + Math.sign(target - m.opacity) * FADE_RATE));
+    }
+    // When real Street View is fully visible, fade out the procedural front face overlays.
+    const proceduralTarget = streetViewMatRef.current && streetViewMatRef.current.opacity > 0.9 ? 0 : 1;
+    proceduralFrontMatsRef.current.forEach((mat) => {
+      const m = mat as THREE.Material & { opacity?: number; transparent?: boolean };
+      if (typeof m.opacity !== "number") return;
+      if (!m.transparent) m.transparent = true;
+      m.opacity = Math.max(0, Math.min(1, m.opacity + Math.sign(proceduralTarget - m.opacity) * FADE_RATE));
+    });
+
     const group = groupRef.current;
     if (group) {
       if (ctx) {
@@ -254,41 +339,62 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
 
   return (
     <group ref={groupRef}>
-      {/* GROUND / LAWN */}
+      {/* GROUND / LAWN — procedural base. Satellite plane crossfades on top of it. */}
       <mesh position={[0, 0, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
         <planeGeometry args={[28, 22]} />
         <meshStandardMaterial color={palette.ground} roughness={0.95} map={lawn ?? undefined} />
       </mesh>
 
-      {/* SIDEWALK strip */}
-      <mesh position={[0, 0.005, 5]} rotation={[-Math.PI / 2, 0, 0]}>
+      {/* SATELLITE TILE — overlay ground when imagery is available. */}
+      {satelliteTexture ? (
+        <mesh position={[0, 0.003, 0]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+          <planeGeometry args={[28, 22]} />
+          <meshStandardMaterial
+            ref={satelliteMatRef}
+            map={satelliteTexture}
+            roughness={0.95}
+            transparent
+            opacity={0}
+            depthWrite={false}
+          />
+        </mesh>
+      ) : null}
+
+      {/* SIDEWALK strip — sits above the satellite to keep the path visible at procedural angle. */}
+      <mesh position={[decoSpots.sidewalkCenter[0], decoSpots.sidewalkCenter[1], decoSpots.sidewalkCenter[2]]} rotation={[-Math.PI / 2, 0, 0]}>
         <planeGeometry args={[2.6, 12]} />
-        <meshStandardMaterial color={palette.sidewalk} roughness={0.85} />
+        <meshStandardMaterial color={palette.sidewalk} roughness={0.85} transparent opacity={hasSatellite ? 0.0 : 1.0} />
       </mesh>
 
-      {/* FOUNDATION */}
-      <mesh position={[0, 0.2, 0]} castShadow>
-        <boxGeometry args={[10, 0.4, 7]} />
-        <meshStandardMaterial color={palette.foundation} roughness={0.9} />
-      </mesh>
+      {useFootprint && footprintGeometry ? (
+        <FootprintShell geometry={footprintGeometry} palette={palette} stucco={stucco} shingle={shingle} />
+      ) : (
+        <>
+          {/* FOUNDATION */}
+          <mesh position={[0, 0.2, 0]} castShadow>
+            <boxGeometry args={[10, 0.4, 7]} />
+            <meshStandardMaterial color={palette.foundation} roughness={0.9} />
+          </mesh>
 
-      {/* WALLS */}
-      <mesh position={[0, 2.3, 0]} castShadow receiveShadow>
-        <boxGeometry args={[9.6, 3.8, 6.6]} />
-        <meshStandardMaterial color={palette.walls} roughness={0.7} map={stucco ?? undefined} />
-        <Edges threshold={20} color={palette.trim} />
-      </mesh>
+          {/* WALLS */}
+          <mesh position={[0, 2.3, 0]} castShadow receiveShadow>
+            <boxGeometry args={[9.6, 3.8, 6.6]} />
+            <meshStandardMaterial color={palette.walls} roughness={0.7} map={stucco ?? undefined} />
+            <Edges threshold={20} color={palette.trim} />
+          </mesh>
 
-      {/* HIP ROOF */}
-      <HipRoof palette={palette} shingle={shingle} />
+          {/* HIP ROOF */}
+          <HipRoof palette={palette} shingle={shingle} />
+        </>
+      )}
 
       {/* CHIMNEY */}
-      <mesh position={[2.9, 5.7, -0.6]} castShadow>
+      <mesh position={decoSpots.chimney} castShadow>
         <boxGeometry args={[0.7, 1.6, 0.7]} />
         <meshStandardMaterial color={palette.chimney} roughness={0.85} />
         <Edges threshold={15} color={palette.trim} />
       </mesh>
-      <mesh position={[2.9, 6.55, -0.6]}>
+      <mesh position={[decoSpots.chimney[0], decoSpots.chimney[1] + 0.85, decoSpots.chimney[2]]}>
         <boxGeometry args={[0.85, 0.12, 0.85]} />
         <meshStandardMaterial color={palette.trim} roughness={0.6} />
       </mesh>
@@ -298,39 +404,84 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
           ref={(el) => {
             if (el) smokeRefs.current[i] = el;
           }}
-          position={[2.9, 4.5, -0.6]}
+          position={[decoSpots.chimney[0], decoSpots.chimney[1] - 1.2, decoSpots.chimney[2]]}
         >
           <sphereGeometry args={[0.18, 12, 12]} />
           <meshBasicMaterial color="#ffffff" transparent opacity={0.4} />
         </mesh>
       ))}
 
-      {/* FRONT WINDOWS — left & right of door */}
-      {[-2.6, 2.6].map((x) => (
-        <group key={x} position={[x, 2.6, 3.31]}>
+      {/* STREET VIEW FRONT WALL PLANE — overlays the procedural front face when imagery is ready. */}
+      {streetViewTexture ? (
+        <mesh position={frontFace.center}>
+          <planeGeometry args={[frontFace.width, frontFace.height]} />
+          <meshBasicMaterial
+            ref={streetViewMatRef}
+            map={streetViewTexture}
+            transparent
+            opacity={0}
+            toneMapped={false}
+            depthWrite={false}
+          />
+        </mesh>
+      ) : null}
+
+      {/* FRONT WINDOWS — left & right of door. Materials registered for fadeout when Street View arrives. */}
+      {[-frontFace.width * 0.27, frontFace.width * 0.27].map((x) => (
+        <group key={x} position={[x, frontFace.center[1] + 0.3, frontFace.center[2] + 0.005]}>
           <mesh>
             <boxGeometry args={[1.5, 1.4, 0.08]} />
-            <meshStandardMaterial color={palette.windowFrame} roughness={0.5} />
+            <meshStandardMaterial
+              color={palette.windowFrame}
+              roughness={0.5}
+              transparent
+              opacity={1}
+              ref={(m) => {
+                if (m && !proceduralFrontMatsRef.current.includes(m)) proceduralFrontMatsRef.current.push(m);
+              }}
+            />
           </mesh>
           <mesh position={[0, 0, 0.05]} material={glassMaterial}>
             <planeGeometry args={[1.3, 1.2]} />
           </mesh>
           <mesh position={[0, 0, 0.06]}>
             <boxGeometry args={[0.05, 1.2, 0.02]} />
-            <meshStandardMaterial color={palette.windowFrame} />
+            <meshStandardMaterial
+              color={palette.windowFrame}
+              transparent
+              opacity={1}
+              ref={(m) => {
+                if (m && !proceduralFrontMatsRef.current.includes(m)) proceduralFrontMatsRef.current.push(m);
+              }}
+            />
           </mesh>
           <mesh position={[0, 0, 0.06]}>
             <boxGeometry args={[1.3, 0.05, 0.02]} />
-            <meshStandardMaterial color={palette.windowFrame} />
+            <meshStandardMaterial
+              color={palette.windowFrame}
+              transparent
+              opacity={1}
+              ref={(m) => {
+                if (m && !proceduralFrontMatsRef.current.includes(m)) proceduralFrontMatsRef.current.push(m);
+              }}
+            />
           </mesh>
         </group>
       ))}
 
       {/* FRONT DOOR (slightly ajar 8°) */}
-      <group position={[0, 1.5, 3.31]} rotation={[0, -0.14, 0]}>
+      <group position={[0, frontFace.center[1] - frontFace.height * 0.21, frontFace.center[2] + 0.005]} rotation={[0, -0.14, 0]}>
         <mesh castShadow>
           <boxGeometry args={[1.2, 2.4, 0.1]} />
-          <meshStandardMaterial color={palette.door} roughness={0.55} />
+          <meshStandardMaterial
+            color={palette.door}
+            roughness={0.55}
+            transparent
+            opacity={1}
+            ref={(m) => {
+              if (m && !proceduralFrontMatsRef.current.includes(m)) proceduralFrontMatsRef.current.push(m);
+            }}
+          />
           <Edges threshold={20} color={palette.trim} />
         </mesh>
         <mesh position={[0.45, 0, 0.07]}>
@@ -340,7 +491,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       </group>
 
       {/* MAILBOX */}
-      <group position={[3.6, 1, 5.5]}>
+      <group position={decoSpots.mailbox}>
         <mesh>
           <boxGeometry args={[0.08, 1.6, 0.08]} />
           <meshStandardMaterial color={palette.trim} />
@@ -354,7 +505,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* HOUSE-NUMBER PLATE */}
       {labelsVisible ? (
         <Html
-          position={[0, 3.2, 3.36]}
+          position={[0, frontFace.center[1] + frontFace.height * 0.24, frontFace.center[2] + 0.05]}
           center
           distanceFactor={8}
           style={{ pointerEvents: "none" }}
@@ -378,7 +529,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       ) : null}
 
       {/* AC CONDENSER (left side) */}
-      <group position={[-5.4, 0.6, 1.2]}>
+      <group position={decoSpots.ac}>
         <mesh castShadow>
           <boxGeometry args={[1, 1.2, 1]} />
           <meshStandardMaterial color={palette.ac} roughness={0.8} metalness={0.1} />
@@ -397,7 +548,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       </group>
 
       {/* DECK / PATIO (right side) */}
-      <group position={[5.4, 0.15, -0.5]}>
+      <group position={decoSpots.deck}>
         <mesh receiveShadow castShadow>
           <boxGeometry args={[1.4, 0.15, 3]} />
           <meshStandardMaterial color={palette.fence} roughness={0.85} />
@@ -417,7 +568,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       </group>
 
       {/* TREE (left front lawn) */}
-      <group position={[-4.5, 0, 6.5]}>
+      <group position={decoSpots.tree}>
         <mesh castShadow position={[0, 0.8, 0]}>
           <cylinderGeometry args={[0.18, 0.22, 1.6, 10]} />
           <meshStandardMaterial color={palette.treeTrunk} roughness={0.95} />
@@ -429,7 +580,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       </group>
 
       {/* SHRUBS (right front) */}
-      <group position={[4, 0.4, 6]}>
+      <group position={decoSpots.shrubs}>
         <mesh castShadow>
           <sphereGeometry args={[0.5, 8, 8]} />
           <meshStandardMaterial color={palette.shrub} roughness={0.85} flatShading />
@@ -444,8 +595,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* ROOF */}
       <Hotspot
         hkey="roof"
-        position={[0, 5.4, 0]}
-        size={[10, 0.4, 7]}
+        position={anchors.roof.position}
+        size={anchors.roof.size}
         hotspot={get("roof")}
         palette={palette}
         suggested={suggestedNext === "roof"}
@@ -456,8 +607,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* GUTTERS — thin band at eave line */}
       <Hotspot
         hkey="gutters"
-        position={[0, 4.25, 0]}
-        size={[10.4, 0.12, 7.4]}
+        position={anchors.gutters.position}
+        size={anchors.gutters.size}
         hotspot={get("gutters")}
         palette={palette}
         suggested={suggestedNext === "gutters"}
@@ -468,8 +619,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* SIDING — left wall plane (primary label here) */}
       <Hotspot
         hkey="siding"
-        position={[-4.85, 2.3, 0]}
-        size={[0.04, 3.6, 6.5]}
+        position={anchors.sidingLeft.position}
+        size={anchors.sidingLeft.size}
         hotspot={get("siding")}
         palette={palette}
         suggested={suggestedNext === "siding"}
@@ -480,8 +631,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* SIDING — right wall plane (no label) */}
       <Hotspot
         hkey="siding"
-        position={[4.85, 2.3, 0]}
-        size={[0.04, 3.6, 6.5]}
+        position={anchors.sidingRight.position}
+        size={anchors.sidingRight.size}
         hotspot={get("siding")}
         palette={palette}
         suggested={suggestedNext === "siding"}
@@ -492,8 +643,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* SIDING — front top band between window-tops and eave */}
       <Hotspot
         hkey="siding"
-        position={[0, 3.85, 3.33]}
-        size={[7.4, 0.6, 0.04]}
+        position={anchors.sidingFrontTop.position}
+        size={anchors.sidingFrontTop.size}
         hotspot={get("siding")}
         palette={palette}
         suggested={suggestedNext === "siding"}
@@ -504,8 +655,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* SIDING — front bottom band between foundation and sills */}
       <Hotspot
         hkey="siding"
-        position={[0, 0.7, 3.33]}
-        size={[7.4, 0.5, 0.04]}
+        position={anchors.sidingFrontBottom.position}
+        size={anchors.sidingFrontBottom.size}
         hotspot={get("siding")}
         palette={palette}
         suggested={suggestedNext === "siding"}
@@ -516,8 +667,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* WINDOWS — left glass, no label (right one carries label) */}
       <Hotspot
         hkey="windows"
-        position={[-2.6, 2.6, 3.36]}
-        size={[1.55, 1.45, 0.04]}
+        position={anchors.windowsLeft.position}
+        size={anchors.windowsLeft.size}
         hotspot={get("windows")}
         palette={palette}
         suggested={suggestedNext === "windows"}
@@ -528,8 +679,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* WINDOWS — right glass, primary label */}
       <Hotspot
         hkey="windows"
-        position={[2.6, 2.6, 3.36]}
-        size={[1.55, 1.45, 0.04]}
+        position={anchors.windowsRight.position}
+        size={anchors.windowsRight.size}
         hotspot={get("windows")}
         palette={palette}
         suggested={suggestedNext === "windows"}
@@ -540,8 +691,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* INTERIOR — door area only */}
       <Hotspot
         hkey="interior"
-        position={[0, 1.55, 3.36]}
-        size={[1.4, 2.5, 0.04]}
+        position={anchors.interior.position}
+        size={anchors.interior.size}
         hotspot={get("interior")}
         palette={palette}
         suggested={suggestedNext === "interior"}
@@ -552,8 +703,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* ATTIC — gable triangle area */}
       <Hotspot
         hkey="attic"
-        position={[0, 5.4, 3.1]}
-        size={[3, 0.6, 0.4]}
+        position={anchors.attic.position}
+        size={anchors.attic.size}
         hotspot={get("attic")}
         palette={palette}
         suggested={suggestedNext === "attic"}
@@ -564,8 +715,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* PERSONAL PROPERTY — back wall */}
       <Hotspot
         hkey="personal_property"
-        position={[2.6, 2.7, -3.32]}
-        size={[3.6, 2.4, 0.05]}
+        position={anchors.personalProperty.position}
+        size={anchors.personalProperty.size}
         hotspot={get("personal_property")}
         palette={palette}
         suggested={suggestedNext === "personal_property"}
@@ -576,8 +727,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* PERIMETER — sidewalk */}
       <Hotspot
         hkey="perimeter"
-        position={[0, 0.05, 5]}
-        size={[2.6, 0.05, 11.5]}
+        position={anchors.perimeter.position}
+        size={anchors.perimeter.size}
         hotspot={get("perimeter")}
         palette={palette}
         suggested={suggestedNext === "perimeter"}
@@ -588,8 +739,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       {/* EXTERIOR COLLATERAL — AC + deck side hints */}
       <Hotspot
         hkey="exterior_collateral"
-        position={[-5.4, 0.7, 1.2]}
-        size={[1.5, 1.6, 1.5]}
+        position={anchors.exteriorCollateralLeft.position}
+        size={anchors.exteriorCollateralLeft.size}
         hotspot={get("exterior_collateral")}
         palette={palette}
         suggested={suggestedNext === "exterior_collateral"}
@@ -599,8 +750,8 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
       />
       <Hotspot
         hkey="exterior_collateral"
-        position={[5.4, 0.7, -0.5]}
-        size={[1.8, 1.4, 3.4]}
+        position={anchors.exteriorCollateralRight.position}
+        size={anchors.exteriorCollateralRight.size}
         hotspot={get("exterior_collateral")}
         palette={palette}
         suggested={suggestedNext === "exterior_collateral"}
@@ -614,34 +765,7 @@ export default function HouseScene({ hotspots, onTap, suggestedNext, palette, la
 
 function HipRoof({ palette, shingle }: { palette: ScenePalette; shingle: THREE.CanvasTexture | null }) {
   const geometry = useMemo(() => {
-    const halfW = 5.0;
-    const halfD = 3.5;
-    const ridgeHalf = 1.5;
-    const apexY = 1.6;
-
-    const vertices = new Float32Array([
-      -halfW, 0, halfD,
-      halfW, 0, halfD,
-      halfW, 0, -halfD,
-      -halfW, 0, -halfD,
-      -ridgeHalf, apexY, 0,
-      ridgeHalf, apexY, 0,
-    ]);
-
-    const indices = new Uint16Array([
-      0, 1, 5,
-      0, 5, 4,
-      1, 2, 5,
-      2, 3, 4,
-      2, 4, 5,
-      3, 0, 4,
-    ]);
-
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
-    geom.setIndex(new THREE.BufferAttribute(indices, 1));
-    geom.computeVertexNormals();
-    return geom;
+    return buildHipRoofGeometry(5.0, 3.5, 1.5, 1.6);
   }, []);
 
   return (
@@ -654,5 +778,138 @@ function HipRoof({ palette, shingle }: { palette: ScenePalette; shingle: THREE.C
       />
       <Edges threshold={15} color={palette.trim} />
     </mesh>
+  );
+}
+
+function buildHipRoofGeometry(halfW: number, halfD: number, ridgeHalf: number, apexY: number) {
+  const vertices = new Float32Array([
+    -halfW, 0, halfD,
+    halfW, 0, halfD,
+    halfW, 0, -halfD,
+    -halfW, 0, -halfD,
+    -ridgeHalf, apexY, 0,
+    ridgeHalf, apexY, 0,
+  ]);
+
+  const indices = new Uint16Array([
+    0, 1, 5,
+    0, 5, 4,
+    1, 2, 5,
+    2, 3, 4,
+    2, 4, 5,
+    3, 0, 4,
+  ]);
+
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(vertices, 3));
+  geom.setIndex(new THREE.BufferAttribute(indices, 1));
+  geom.computeVertexNormals();
+  return geom;
+}
+
+/**
+ * FootprintShell — renders walls extruded from the building polygon ring + a
+ * hip roof fitted to the polygon's bounding box. Replaces the hardcoded
+ * box+HipRoof when an actual footprint is available.
+ */
+function FootprintShell({
+  geometry,
+  palette,
+  stucco,
+  shingle,
+}: {
+  geometry: FootprintHouseGeometry;
+  palette: ScenePalette;
+  stucco: THREE.CanvasTexture | null;
+  shingle: THREE.CanvasTexture | null;
+}) {
+  const wallExtrude = useMemo(() => {
+    const shape = new THREE.Shape();
+    const ring = geometry.ring;
+    if (ring.length < 4) return null;
+    shape.moveTo(ring[0][0], ring[0][1]);
+    for (let i = 1; i < ring.length; i++) {
+      shape.lineTo(ring[i][0], ring[i][1]);
+    }
+    return new THREE.ExtrudeGeometry(shape, {
+      depth: geometry.wallHeight,
+      bevelEnabled: false,
+      curveSegments: 1,
+    });
+  }, [geometry.ring, geometry.wallHeight]);
+
+  const foundationExtrude = useMemo(() => {
+    const shape = new THREE.Shape();
+    const ring = geometry.ring;
+    if (ring.length < 4) return null;
+    // Slightly inset so the foundation reads as a base, not a separate footprint.
+    const inset = 0.05;
+    const cx = 0;
+    const cz = 0;
+    const insetRing = ring.map(([x, z]) => {
+      const dx = x - cx;
+      const dz = z - cz;
+      const len = Math.hypot(dx, dz) || 1;
+      return [x - (dx / len) * inset, z - (dz / len) * inset] as [number, number];
+    });
+    shape.moveTo(insetRing[0][0], insetRing[0][1]);
+    for (let i = 1; i < insetRing.length; i++) {
+      shape.lineTo(insetRing[i][0], insetRing[i][1]);
+    }
+    return new THREE.ExtrudeGeometry(shape, {
+      depth: geometry.foundationHeight,
+      bevelEnabled: false,
+      curveSegments: 1,
+    });
+  }, [geometry.ring, geometry.foundationHeight]);
+
+  const roofGeom = useMemo(() => {
+    const halfW = geometry.width / 2;
+    const halfD = geometry.depth / 2;
+    const ridgeHalf = Math.max(0.4, halfW * 0.3);
+    return buildHipRoofGeometry(halfW, halfD, ridgeHalf, geometry.roofHeight);
+  }, [geometry.width, geometry.depth, geometry.roofHeight]);
+
+  if (!wallExtrude || !foundationExtrude) return null;
+
+  const wallTop = geometry.foundationHeight + geometry.wallHeight;
+
+  return (
+    <group>
+      {/* FOUNDATION */}
+      <mesh
+        position={[0, 0, 0]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        geometry={foundationExtrude}
+        castShadow
+      >
+        <meshStandardMaterial color={palette.foundation} roughness={0.9} />
+      </mesh>
+      {/* WALLS */}
+      <mesh
+        position={[0, geometry.foundationHeight, 0]}
+        rotation={[-Math.PI / 2, 0, 0]}
+        geometry={wallExtrude}
+        castShadow
+        receiveShadow
+      >
+        <meshStandardMaterial
+          color={palette.walls}
+          roughness={0.7}
+          map={stucco ?? undefined}
+        />
+        <Edges threshold={20} color={palette.trim} />
+      </mesh>
+      {/* HIP ROOF — sized to the footprint's bounding box */}
+      <mesh position={[0, wallTop, 0]} geometry={roofGeom} castShadow receiveShadow>
+        <meshStandardMaterial
+          color={palette.roof}
+          roughness={0.78}
+          side={THREE.DoubleSide}
+          map={shingle ?? undefined}
+        />
+        <Edges threshold={15} color={palette.trim} />
+      </mesh>
+    </group>
   );
 }

@@ -45,6 +45,7 @@ import {
   type PersonalPropertyRoomKey,
   type ExteriorCollateralItem,
   type ExteriorCollateralType,
+  type BuildingFootprint,
 } from "@/types/inspection";
 import HouseHub, { type HotspotState } from "@/components/inspection/HouseHub";
 import SectionDrawer from "@/components/inspection/SectionDrawer";
@@ -55,6 +56,7 @@ import DetachedFullScreen from "@/components/inspection/DetachedFullScreen";
 import ReportBuilder from "@/components/inspection/ReportBuilder";
 import type { RepSignatureRow as RBRepSignatureRow } from "@/components/inspection/ReportBuilder";
 import { useInspectionAutosave } from "@/hooks/useInspectionAutosave";
+import { useInspectionImagery } from "@/hooks/useInspectionImagery";
 import type { JsonRecord } from "@/types/models";
 
 type KnockSessionRow = JsonRecord & {
@@ -584,6 +586,7 @@ export default function KnockingPage() {
     signaturePath: null,
   });
   const [activeInspectionId, setActiveInspectionId] = useState<string | null>(null);
+  const [buildingFootprint, setBuildingFootprint] = useState<BuildingFootprint | null>(null);
   // ── /Hub v3 state ─────────────────────────────────────────────────────────
 
   const [syncQueueCount, setSyncQueueCount] = useState(0);
@@ -679,6 +682,13 @@ export default function KnockingPage() {
   const knockStageIdsRef = useRef<Partial<Record<KnockStageTarget, number>> | null>(null);
 
   const { scheduleSave, saveLabel } = useInspectionAutosave({ inspectionId: activeInspectionId });
+  const inspectionImagery = useInspectionImagery({
+    inspectionId: activeInspectionId,
+    address: homeownerIntake.address,
+    lat: currentLat,
+    lng: currentLng,
+    accessToken,
+  });
 
   // Autosave new hub state slices (PP, EC, detached) — debounced inside the hook.
   useEffect(() => {
@@ -3455,6 +3465,19 @@ export default function KnockingPage() {
             {/* ── House Hub ──────────────────────────────────── */}
             <HouseHub
               labelsVisible={!showRoofHub && !showReportBuilder && !activeHubSection && !activeDetachedId && !showGeneralNotes}
+              imageryStatus={inspectionImagery.status}
+              satelliteUrl={inspectionImagery.satelliteUrl}
+              streetViewUrl={inspectionImagery.streetViewUrl}
+              address={homeownerIntake.address ?? null}
+              lat={currentLat ?? session?.latest_latitude ?? null}
+              lng={currentLng ?? session?.latest_longitude ?? null}
+              cachedFootprint={buildingFootprint}
+              onFootprintFetched={(fp) => {
+                setBuildingFootprint(fp);
+                if (activeInspectionId && fp) {
+                  scheduleSave({ metadata: { buildingFootprint: fp } });
+                }
+              }}
               hotspots={([
                 { key: "roof", label: "Roof" },
                 { key: "perimeter", label: "Perimeter" },

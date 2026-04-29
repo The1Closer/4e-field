@@ -1797,6 +1797,61 @@ button.danger:hover {
 .h3d-zoom-btn:hover { background: rgba(0, 0, 0, 0.7); }
 .h3d-zoom-btn:active { transform: scale(0.94); }
 .h3d-zoom-btn--reset { font-size: 16px; }
+
+/* Imagery status badge — bottom-left of the canvas. */
+.h3d-imagery-badge {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 6px 10px;
+  border-radius: 999px;
+  background: rgba(10, 14, 22, 0.62);
+  color: #fff;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+  transition: opacity 220ms ease;
+  pointer-events: none;
+  user-select: none;
+}
+.h3d-imagery-badge__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #d6b37a;
+  box-shadow: 0 0 0 2px rgba(214, 179, 122, 0.18);
+}
+.h3d-imagery-badge--loading .h3d-imagery-badge__dot {
+  background: #d6b37a;
+  animation: h3d-badge-pulse 1.2s ease-in-out infinite;
+}
+.h3d-imagery-badge--ready .h3d-imagery-badge__dot {
+  background: #4adb87;
+  box-shadow: 0 0 0 2px rgba(74, 219, 135, 0.22);
+}
+.h3d-imagery-badge--partial .h3d-imagery-badge__dot {
+  background: #f0c168;
+  box-shadow: 0 0 0 2px rgba(240, 193, 104, 0.22);
+}
+.h3d-imagery-badge--stylized {
+  opacity: 0.78;
+}
+.h3d-imagery-badge--stylized .h3d-imagery-badge__dot {
+  background: #8a8f99;
+  box-shadow: 0 0 0 2px rgba(138, 143, 153, 0.22);
+}
+@keyframes h3d-badge-pulse {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.18); }
+}
 .h3d-canvas-wrap--loading {
   background: linear-gradient(135deg, var(--panel-soft) 0%, var(--panel) 100%);
   position: relative;
